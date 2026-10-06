@@ -107,6 +107,8 @@ final class Feed: ObservableObject {
     private var proc: Process?
     private var buffer = Data()
     private var stopping = false
+    private var failures = 0     // restarts in a row without a good snapshot, for the backoff
+    private var lastError = ""   // last stderr line; shown only if the feed dies
     private let decoder: JSONDecoder = {
         let d = JSONDecoder()
         d.keyDecodingStrategy = .convertFromSnakeCase
@@ -141,6 +143,8 @@ final class Feed: ObservableObject {
             problem = "ccwatch.py not found inside or next to ccwidget.app"
             return
         }
+        buffer = Data()
+        lastError = ""
         let p = Process()
         p.executableURL = URL(fileURLWithPath: Feed.locatePython())
         p.arguments = ["-B", script, "--json"]
@@ -155,14 +159,19 @@ final class Feed: ObservableObject {
         err.fileHandleForReading.readabilityHandler = { [weak self] h in
             let d = h.availableData
             guard !d.isEmpty, let s = String(data: d, encoding: .utf8) else { return }
+            // a warning on stderr isn't a failure; keep it in case the feed dies
             let last = s.split(separator: "\n").last.map(String.init) ?? s
-            DispatchQueue.main.async { self?.problem = last }
+            DispatchQueue.main.async { self?.lastError = last }
         }
         p.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self = self, !self.stopping else { return }
-                self.problem = self.problem ?? "ccwatch stopped; restarting…"
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.start() }
+                // 3 s, 6 s, 12 s … up to a minute while it keeps failing
+                let delay = min(60, 3 * pow(2, Double(self.failures)))
+                self.failures += 1
+                self.problem = (self.lastError.isEmpty ? "ccwatch stopped" : self.lastError)
+                    + "; restarting in \(Int(delay))s…"
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { self.start() }
             }
         }
         do {
@@ -201,6 +210,7 @@ final class Feed: ObservableObject {
             snap = try decoder.decode(Snapshot.self, from: line)
             updated = Date()
             problem = nil
+            failures = 0
         } catch {
             problem = "bad data from ccwatch: \(error)"
         }
@@ -684,14 +694,23 @@ struct ProjectsSection: View {
 
 // MARK: - Widget
 
+/// Whether a host window is on screen; while it isn't, the widget stops animating.
+final class Visibility: ObservableObject {
+    @Published var visible: Bool
+    init(_ visible: Bool) { self.visible = visible }
+}
+
 struct WidgetView: View {
     @ObservedObject var feed: Feed
+    @ObservedObject var visibility: Visibility
     @AppStorage("compact") var compact = false
     var chrome = true  // false inside the menu bar popover, which brings its own frame
     var onSize: (CGSize) -> Void
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 0.1)) { tl in
+        // 10 fps while something is working or waiting, 2 fps when all is idle, none while hidden
+        let animating = feed.snap?.sessions.contains { $0.state == "busy" || $0.state == "wait" } ?? true
+        TimelineView(.animation(minimumInterval: animating ? 0.1 : 0.5, paused: !visibility.visible)) { tl in
             let frame = Int(tl.date.timeIntervalSinceReferenceDate * 10)
             content(frame: frame)
                 .frame(width: compact ? 300 : 370)
@@ -1044,6 +1063,8 @@ final class WidgetPanel: NSPanel {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let feed = Feed()
+    let panelVisibility = Visibility(false)
+    let popoverVisibility = Visibility(false)
     var panel: WidgetPanel!
     var statusItem: NSStatusItem!
     let popover = NSPopover()
@@ -1064,7 +1085,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.hidesOnDeactivate = false
         panel.alphaValue = UserDefaults.standard.object(forKey: "opacity") as? Double ?? 1
 
-        let view = WidgetView(feed: feed, onSize: { [weak self] in self?.fit($0) })
+        let view = WidgetView(feed: feed, visibility: panelVisibility, onSize: { [weak self] in self?.fit($0) })
         let host = NSHostingView(rootView: view)
         host.sizingOptions = []
         panel.contentView = host
@@ -1090,6 +1111,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if UserDefaults.standard.object(forKey: "floating") as? Bool ?? true {
             panel.orderFrontRegardless()
         }
+        // covered by a full-screen app, on another display that's asleep, or hidden from the menu
+        NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification,
+                                               object: panel, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.panelVisibility.visible = self.panel.occlusionState.contains(.visible)
+        }
+        panelVisibility.visible = panel.isVisible
         setUpStatusItem()
         setUpAssistant()
         feed.start()
@@ -1226,7 +1254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: Menu bar icon
 
     func setUpStatusItem() {
-        let content = NSHostingController(rootView: WidgetView(feed: feed, chrome: false, onSize: { [weak self] size in
+        let content = NSHostingController(rootView: WidgetView(feed: feed, visibility: popoverVisibility, chrome: false, onSize: { [weak self] size in
             guard let self = self, size.width > 0, size.height > 0, self.popover.contentSize != size else { return }
             self.popover.contentSize = size
         }))
@@ -1513,8 +1541,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         UserDefaults.standard.set(a, forKey: "opacity")
     }
 
+    func popoverWillShow(_ note: Notification) {
+        popoverVisibility.visible = true
+    }
+
     func popoverWillClose(_ note: Notification) {
         popoverClosed = Date()
+    }
+
+    func popoverDidClose(_ note: Notification) {
+        popoverVisibility.visible = false
     }
 
     var aboutWindow: NSWindow?

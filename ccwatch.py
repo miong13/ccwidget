@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """ccwatch — animated terminal dashboard of running Claude Code sessions.
 
-Data sources (all local, read-only):
+Data sources (all local; ccwatch only reads them, and only ever deletes stale
+files from its own ~/.cache/ccwatch):
   ~/.claude/sessions/<pid>.json            live registry written by each claude process
   ~/.claude/projects/*/<sessionId>.jsonl   session transcript (current tool, title, model)
   ~/.claude/projects/*/<sessionId>/subagents/*.jsonl   sub-agent transcripts
@@ -41,6 +42,9 @@ SPARK_LEN = 20
 MAX_CARD_W = 80
 LEDGER_INTERVAL = 5.0      # seconds between scans for today's token totals
 IDLE_GAP = 300             # pauses longer than this between transcript events don't count as time spent
+PRUNE_INTERVAL = 3600      # seconds between clean-ups of ~/.cache/ccwatch
+CAPTURE_MAX_AGE = 8 * 86400   # status line captures older than this are deleted (longest limit window + a day)
+STATE_MAX_AGE = 86400      # "needs you" flags of sessions that are gone and this old are deleted
 
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SPARK = "▁▁▂▃▄▅▆▇█"  # index 0 = no activity
@@ -271,7 +275,7 @@ class Session:
 
 
 # `git commit` where a shell command starts, not merely mentioned in a string
-GIT_COMMIT = re.compile(r"(?:^|[;&|(]|\bthen|\bdo)\s*git\s+(?:-[Cc]\s+\S+\s+)*commit\b", re.M)
+GIT_COMMIT = re.compile(r"(?:^|[;&|(]|\bthen|\bdo)\s*git\s+(?:-[Cc]\s+\S+\s+)*commit(?![\w-])", re.M)
 
 
 def active_time(stamps, midnight):
@@ -490,6 +494,26 @@ class Store:
         self.cost_today = 0.0    # summed session cost of every capture written today
         self.cost_sessions = 0
         self.project_cost = {}   # cwd -> summed session cost today
+        self.last_prune = 0.0
+
+    def prune(self):
+        """Delete ccwatch's own stale cache files: old status line captures, and
+        "needs you" flags left behind by sessions that crashed. The terminal
+        dashboard and the widget's feed may both do this at once, so a file that
+        has already gone is fine."""
+        now = time.time()
+        live = {s.sid for s in self.sessions.values()}
+        for pattern, max_age in ((os.path.join(STATUSLINE_DIR, "*.json"), CAPTURE_MAX_AGE),
+                                 (os.path.join(STATE_DIR, "*.json"), STATE_MAX_AGE)):
+            for path in glob.glob(pattern):
+                if os.path.basename(path)[:-len(".json")] in live:
+                    continue
+                try:
+                    if now - os.path.getmtime(path) > max_age:
+                        os.remove(path)
+                except OSError:
+                    pass
+        self.last_prune = now
 
     def refresh(self):
         seen = set()
@@ -541,6 +565,8 @@ class Store:
 
         if time.time() - self.ledger.last_scan >= LEDGER_INTERVAL:
             self.ledger.refresh()
+        if time.time() - self.last_prune >= PRUNE_INTERVAL:
+            self.prune()
 
     def ordered(self):
         return sorted(self.sessions.values(),
