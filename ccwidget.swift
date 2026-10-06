@@ -9,10 +9,14 @@
 // It also lives in the menu bar: click the icon for the same view in a popover,
 // right-click it for the options menu. While a session waits on you, a hovering
 // robot assistant holds up a card of those sessions; click one to jump to it.
+// Notifications say when a long turn finishes or a plan limit runs high, and
+// ⌃⌥⌘J / ⌃⌥⌘W jump to the waiting session / show or hide the floating panel.
 
 import AppKit
+import Carbon.HIToolbox
 import Combine
 import SwiftUI
+import UserNotifications
 
 // MARK: - Feed data (mirrors snapshot() in ccwatch.py)
 
@@ -1154,6 +1158,161 @@ struct AssistantView: View {
     }
 }
 
+// MARK: - Notifications
+
+/// "45s", "5m12s", "1h05m"
+func fmtDuration(_ secs: Double) -> String {
+    let s = Int(max(0, secs))
+    if s < 60 { return "\(s)s" }
+    if s < 3600 { return String(format: "%dm%02ds", s / 60, s % 60) }
+    return String(format: "%dh%02dm", s / 3600, s % 3600 / 60)
+}
+
+/// macOS notifications from the snapshots: a long turn finished, a session needs
+/// you (off by default; the hovering assistant covers that), a plan limit
+/// crossed 80%, 95% or 100%. Clicking one about a session jumps to its window.
+final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+    enum Kind: String, CaseIterable {
+        case finished = "notifyFinished", waiting = "notifyWaiting", limits = "notifyLimits"
+
+        var title: String {
+            switch self {
+            case .finished: return "When a Long Turn Finishes"
+            case .waiting: return "When a Session Needs You"
+            case .limits: return "Plan Limit Warnings"
+            }
+        }
+
+        var enabled: Bool { UserDefaults.standard.object(forKey: rawValue) as? Bool ?? (self != .waiting) }
+    }
+
+    /// Seconds a turn must run before its end is worth a notification.
+    static var finishedAfter: Double { UserDefaults.standard.object(forKey: "notifyAfter") as? Double ?? 120 }
+    static let thresholds = [100, 95, 80]
+
+    private var watch: AnyCancellable?
+    private var last: [Int: (state: String, secs: Double)] = [:]  // by pid, from the previous snapshot
+    private var primed = false  // the first snapshot only sets the baseline
+
+    init(feed: Feed) {
+        super.init()
+        UNUserNotificationCenter.current().delegate = self
+        watch = feed.$snap.receive(on: RunLoop.main).sink { [weak self] in self?.update($0) }
+    }
+
+    private func update(_ snap: Snapshot?) {
+        guard let snap = snap else { return }
+        var now: [Int: (state: String, secs: Double)] = [:]
+        for s in snap.sessions {
+            guard let pid = s.pid else { continue }
+            now[pid] = (s.state, s.stateSecs ?? 0)
+            guard primed, let prev = last[pid] else { continue }
+            let title = s.title?.isEmpty == false ? s.title! : s.name
+            if prev.state == "busy", s.state == "idle", Kind.finished.enabled, prev.secs >= Self.finishedAfter {
+                post(id: "finished-\(pid)", title: "Finished: \(title)",
+                     body: "\(s.project ?? s.name) · worked \(fmtDuration(prev.secs))", pid: pid)
+            }
+            if prev.state != "wait", s.state == "wait", Kind.waiting.enabled {
+                post(id: "waiting-\(pid)", title: "Needs you: \(title)",
+                     body: [s.doing, s.detail].compactMap { $0?.isEmpty == false ? $0 : nil }.joined(separator: " · "),
+                     pid: pid)
+            }
+        }
+        last = now
+        primed = true
+        checkLimits(snap.limits)
+    }
+
+    /// Each threshold fires once per window; what has fired is kept across launches.
+    private func checkLimits(_ limits: [Limit]) {
+        let d = UserDefaults.standard
+        let nowEpoch = Date().timeIntervalSince1970
+        var fired = (d.dictionary(forKey: "limitAlerts") as? [String: Int] ?? [:])
+            .filter { (Double($0.key.split(separator: "@").last ?? "") ?? 0) * 3600 > nowEpoch - 3600 }  // drop past windows
+        for l in limits {
+            guard let key = l.key, let at = l.resetsAt,
+                  let hit = Self.thresholds.first(where: { l.used >= Double($0) }) else { continue }
+            let id = "\(key)@\(Int(at / 3600))"  // the hour of the reset, in case resets_at jitters
+            guard hit > fired[id] ?? 0 else { continue }
+            fired[id] = hit
+            guard Kind.limits.enabled else { continue }
+            let resets = AppDelegate.untilReset(l).map { "resets in \($0)" } ?? ""
+            post(id: "limit-\(id)", title: hit >= 100 ? "\(l.label.capitalized) limit reached" : "\(l.label.capitalized) limit \(Int(l.used))% used",
+                 body: [resets, l.pace ?? ""].filter { !$0.isEmpty }.joined(separator: " · "), pid: nil)
+        }
+        d.set(fired, forKey: "limitAlerts")
+    }
+
+    /// Asks for permission the first time; after that macOS remembers the answer.
+    private func post(id: String, title: String, body: String, pid: Int?) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        if let pid = pid { content.userInfo = ["pid": pid] }
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { ok, _ in
+            guard ok else { return }
+            center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+        }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
+        done([.banner, .sound])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler done: @escaping () -> Void) {
+        if let pid = response.notification.request.content.userInfo["pid"] as? Int {
+            DispatchQueue.main.async { Feed.focus(pid: pid) }
+        }
+        done()
+    }
+}
+
+// MARK: - Global shortcuts
+
+/// System-wide shortcuts through Carbon's RegisterEventHotKey, which needs no
+/// Accessibility permission. Each is ⌃⌥⌘ plus a key.
+final class HotKeys {
+    private var refs: [EventHotKeyRef] = []
+    private var handler: EventHandlerRef?
+    private var actions: [UInt32: () -> Void] = [:]
+
+    /// keys: (virtual key code, action)
+    func register(_ keys: [(Int, () -> Void)]) {
+        unregister()
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, me in
+            var id = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
+            let hotKeys = Unmanaged<HotKeys>.fromOpaque(me!).takeUnretainedValue()
+            DispatchQueue.main.async { hotKeys.actions[id.id]?() }
+            return noErr
+        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handler)
+        for (n, (code, action)) in keys.enumerated() {
+            var ref: EventHotKeyRef?
+            let id = EventHotKeyID(signature: OSType(0x6363_7767), id: UInt32(n + 1))  // 'ccwg'
+            // a key another app already holds just doesn't register
+            if RegisterEventHotKey(UInt32(code), UInt32(controlKey | optionKey | cmdKey), id,
+                                   GetApplicationEventTarget(), 0, &ref) == noErr, let ref = ref {
+                refs.append(ref)
+                actions[id.id] = action
+            }
+        }
+    }
+
+    func unregister() {
+        refs.forEach { UnregisterEventHotKey($0) }
+        refs = []
+        actions = [:]
+        if let h = handler { RemoveEventHandler(h) }
+        handler = nil
+    }
+}
+
 // MARK: - App
 
 
@@ -1222,6 +1381,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         setUpStatusItem()
         setUpAssistant()
         feed.start()
+        notifier = Notifier(feed: feed)
+        updateHotKeys()
+    }
+
+    // MARK: Notifications and shortcuts
+
+    var notifier: Notifier?
+    let hotKeys = HotKeys()
+
+    var hotKeysOn: Bool { UserDefaults.standard.object(forKey: "hotkeys") as? Bool ?? true }
+
+    func updateHotKeys() {
+        guard hotKeysOn else { return hotKeys.unregister() }
+        hotKeys.register([(kVK_ANSI_J, { [weak self] in self?.jumpToWaiting() }),
+                          (kVK_ANSI_W, { [weak self] in self?.toggleFloating() })])
+    }
+
+    /// ⌃⌥⌘J: the session that has waited longest, or the popover when none is waiting.
+    func jumpToWaiting() {
+        let waiting = (feed.snap?.sessions ?? []).filter { $0.state == "wait" && $0.pid != nil }
+        if let s = waiting.max(by: { ($0.stateSecs ?? 0) < ($1.stateSecs ?? 0) }), let pid = s.pid {
+            Feed.focus(pid: pid)
+        } else if let button = statusItem.button, !popover.isShown {
+            NSApp.activate(ignoringOtherApps: true)
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    @objc func toggleHotKeys() {
+        UserDefaults.standard.set(!hotKeysOn, forKey: "hotkeys")
+        updateHotKeys()
+    }
+
+    @objc func toggleNotification(_ sender: NSMenuItem) {
+        guard let kind = (sender.representedObject as? String).flatMap(Notifier.Kind.init(rawValue:)) else { return }
+        UserDefaults.standard.set(!kind.enabled, forKey: kind.rawValue)
     }
 
     // MARK: Hovering assistant
@@ -1642,6 +1837,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let helper = item("Show hovering assistant", #selector(toggleAssistant))
         helper.state = UserDefaults.standard.object(forKey: "assistant") as? Bool ?? true ? .on : .off
         menu.addItem(helper)
+        let notifications = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
+        let nsub = NSMenu()
+        for kind in Notifier.Kind.allCases {
+            let i = item(kind == .finished ? "\(kind.title) (\(fmtDuration(Notifier.finishedAfter))+)" : kind.title,
+                         #selector(toggleNotification(_:)))
+            i.representedObject = kind.rawValue
+            i.state = kind.enabled ? .on : .off
+            nsub.addItem(i)
+        }
+        notifications.submenu = nsub
+        menu.addItem(notifications)
+        let keys = item("Global Shortcuts: ⌃⌥⌘J Jump · ⌃⌥⌘W Panel", #selector(toggleHotKeys))
+        keys.state = hotKeysOn ? .on : .off
+        menu.addItem(keys)
         menu.addItem(item("Open full dashboard", #selector(openDashboard)))
         menu.addItem(item("Set Up Hooks & Status Line…", #selector(runSetup)))
         menu.addItem(item("Run Diagnostics…", #selector(runDoctor)))
