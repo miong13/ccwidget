@@ -1371,9 +1371,10 @@ def snapshot(store):
         top = max(spark) or 1
         cost = s.sl.get("cost") or {}
         sessions.append({
-            "pid": s.pid, "name": s.name, "title": s.title or "", "project": s.project, "model": pretty_model(s.model),
+            "pid": s.pid, "sid": s.sid, "cwd": s.info.get("cwd"), "transcript": s.transcript,
+            "name": s.name, "title": s.title or "", "project": s.project, "model": pretty_model(s.model),
             "state": st, "status": s.status, "doing": doing, "detail": detail or "",
-            "elapsed": fmt_dur(elapsed), "uptime": fmt_dur(s.uptime_secs()),
+            "elapsed": fmt_dur(elapsed), "state_secs": round(max(0, elapsed), 1), "uptime": fmt_dur(s.uptime_secs()),
             "ctx": (s.sl.get("context_window") or {}).get("used_percentage"),
             "cost": cost.get("total_cost_usd"),
             "subs": [sa.desc for sa in s.active_subs()], "subs_total": len(s.subs),

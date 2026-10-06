@@ -26,6 +26,9 @@ struct Snapshot: Decodable {
 
 struct Sess: Decodable {
     var pid: Int?
+    var sid: String?
+    var cwd: String?
+    var transcript: String?
     var name: String
     var title: String?
     var project: String?
@@ -35,6 +38,7 @@ struct Sess: Decodable {
     var doing: String?
     var detail: String?
     var elapsed: String?
+    var stateSecs: Double?   // seconds in the current state (since the wait began, when waiting)
     var uptime: String?
     var ctx: Double?
     var cost: Double?
@@ -475,6 +479,31 @@ struct SectionTitle: View {
     }
 }
 
+/// Context-window fill: a short bar and its percentage, green / yellow / red like the dashboard.
+struct CtxGauge: View {
+    let pct: Double
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ZStack(alignment: .leading) {
+                Capsule().fill(Palette.faint)
+                Capsule().fill(Palette.level(pct)).frame(width: max(2, 28 * CGFloat(min(pct, 100)) / 100))
+            }
+            .frame(width: 28, height: 4)
+            Text("\(Int(pct.rounded()))%")
+                .font(.system(size: 9.5, weight: pct >= 80 ? .bold : .regular))
+                .foregroundColor(pct >= 80 ? Palette.level(pct) : Palette.dim)
+                .monospacedDigit()
+        }
+        .help("Context window \(Int(pct.rounded()))% full" + (pct >= 80 ? " · time to /compact" : ""))
+    }
+}
+
+/// The session row under the pointer, for the right-click menu (see AppDelegate).
+enum HoverTarget {
+    static var session: Sess?
+}
+
 struct SessionRow: View {
     let s: Sess
     let frame: Int
@@ -500,6 +529,9 @@ struct SessionRow: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 4)
+                if let ctx = s.ctx, !compact || ctx >= 80 {  // compact: only as a warning
+                    CtxGauge(pct: ctx)
+                }
                 Text(s.elapsed ?? "")
                     .font(.system(size: 10))
                     .foregroundColor(stateColor)
@@ -550,15 +582,32 @@ struct SessionRow: View {
         )
         .contentShape(RoundedRectangle(cornerRadius: 8))
         .onHover { inside in  // click jumps to the session's window
+            if inside {
+                HoverTarget.session = s
+            } else if HoverTarget.session?.pid == s.pid {
+                HoverTarget.session = nil
+            }
             guard s.pid != nil, inside != hovering else { return }
             hovering = inside
             if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
         }
-        .onDisappear { if hovering { NSCursor.pop() } }
+        .onDisappear {
+            if hovering { NSCursor.pop() }
+            if HoverTarget.session?.pid == s.pid { HoverTarget.session = nil }
+        }
         .onTapGesture {
             if let pid = s.pid { Feed.focus(pid: pid) }
         }
-        .help(s.pid == nil ? "" : "Click to show this session's window")
+        .help(tooltip)
+    }
+
+    private var tooltip: String {
+        var facts = [s.model, s.uptime.map { "up \($0)" }].compactMap { $0?.isEmpty == false ? $0 : nil }
+        if let ctx = s.ctx { facts.append("ctx \(Int(ctx.rounded()))%") }
+        if let cost = s.cost { facts.append(String(format: "≈$%.2f", cost)) }
+        var lines = [facts.joined(separator: " · ")].filter { !$0.isEmpty }
+        if s.pid != nil { lines.append("Click to show this session's window · right-click for more") }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -1099,7 +1148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                   window === self.panel || window === self.assistantPanel
                     || window === self.popover.contentViewController?.view.window,
                   event.type == .rightMouseDown || event.modifierFlags.contains(.control) else { return event }
-            NSMenu.popUpContextMenu(self.buildMenu(), with: event, for: view)
+            NSMenu.popUpContextMenu(self.buildMenu(session: HoverTarget.session), with: event, for: view)
             return nil
         }
 
@@ -1500,8 +1549,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     static let opacities = [100, 90, 80, 70, 60, 50]
 
     /// Built fresh on each right-click so the checkmarks match the current settings.
-    func buildMenu() -> NSMenu {
+    /// Right-clicking a session row puts that session's actions at the top.
+    func buildMenu(session: Sess? = nil) -> NSMenu {
         let menu = NSMenu()
+        if let s = session, s.pid != nil {
+            let header = NSMenuItem(title: s.title?.isEmpty == false ? s.title! : s.name, action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            let actions: [(String, Selector, Bool)] = [
+                ("Jump to Window", #selector(jumpToSession(_:)), true),
+                ("Copy Resume Command", #selector(copyResumeCommand(_:)), s.sid != nil && s.cwd != nil),
+                ("Reveal Project in Finder", #selector(revealProject(_:)), s.cwd != nil),
+                ("Reveal Transcript in Finder", #selector(revealTranscript(_:)), s.transcript != nil),
+            ]
+            for (title, action, enabled) in actions where enabled {
+                let i = item(title, action)
+                i.representedObject = s
+                menu.addItem(i)
+            }
+            menu.addItem(.separator())
+        }
         menu.addItem(item("About ccwidget", #selector(showAbout)))
         menu.addItem(.separator())
         let compact = UserDefaults.standard.bool(forKey: "compact")
@@ -1533,6 +1600,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
         i.target = self
         return i
+    }
+
+    @objc func jumpToSession(_ sender: NSMenuItem) {
+        if let pid = (sender.representedObject as? Sess)?.pid { Feed.focus(pid: pid) }
+    }
+
+    /// `cd '<project>' && claude --resume <session id>`, ready to paste into a terminal.
+    @objc func copyResumeCommand(_ sender: NSMenuItem) {
+        guard let s = sender.representedObject as? Sess, let sid = s.sid, let cwd = s.cwd else { return }
+        let quoted = "'" + cwd.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("cd \(quoted) && claude --resume \(sid)", forType: .string)
+    }
+
+    @objc func revealProject(_ sender: NSMenuItem) {
+        guard let cwd = (sender.representedObject as? Sess)?.cwd else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: cwd)])
+    }
+
+    @objc func revealTranscript(_ sender: NSMenuItem) {
+        guard let path = (sender.representedObject as? Sess)?.transcript else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
     @objc func setOpacity(_ sender: NSMenuItem) {
