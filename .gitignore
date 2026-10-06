@@ -1,0 +1,4 @@
+ccwidget.app/
+dist/
+__pycache__/
+.DS_Store
