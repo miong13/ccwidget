@@ -1,4 +1,4 @@
-# ccwatch — Claude Code command center
+# ccwidget - The Claude Code Monitoring Widget
 
 An animated terminal dashboard of every Claude Code session running on this machine: what each one is doing, which ones are waiting on you, their sub-agents, your plan usage, and the projects you've worked on today. It also comes as **ccwidget**, a macOS menu bar app and floating widget.
 
