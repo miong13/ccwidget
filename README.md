@@ -74,7 +74,7 @@ Requirements: macOS (tested; Linux should work but hasn't been tried), Python 3.
 
 ## Desktop widget
 
-`ccwidget.app` shows the same live data in two places: a small panel that floats above your other windows (it stays visible on every Space and over full-screen apps and never takes keyboard focus, so it can sit in a corner while you work), and a menu bar icon that opens the same view in a drop-down popover.
+`ccwidget.app` shows the same live data in two places: a small panel that floats above your other windows (it stays visible on every Space and over full-screen apps and never takes keyboard focus, so it can sit in a corner while you work), and a menu bar icon that opens the same view in a drop-down popover. A third piece, the *hovering assistant*, appears only when a session needs you.
 
 ```sh
 ./build-widget.sh        # needs Xcode or the Command Line Tools (swiftc); takes about a minute
@@ -98,12 +98,25 @@ open ccwidget.app
   - macOS remembers the spot across restarts, rebuilds and updates. It's stored in the widget's settings, so `defaults delete local.ccwatch.widget` resets it.
   - Whether it can sit right of the battery, among the system icons, depends on the macOS version; if it won't go there, put it just left of the battery.
   - On a crowded MacBook menu bar the icon can end up hidden behind the notch; ⌘-drag it further right.
+- **Hovering assistant** is a small robot, in the spirit of Microsoft's Clippy, that hovers on the desktop holding up a card of the sessions waiting on you. These include a permission prompt, a question, a plan to approve, or an MCP input request.
+  - **When it appears:** as soon as any session needs you. It fades in and hovers in place, bobbing gently on its thruster.
+  - **When it leaves:** clicking a session doesn't close it. It stays until every waiting session has been answered, and each answered one drops off the card within a second or so. When the last one goes:
+    1. The card turns green with *All caught up*, and the robot smiles.
+    2. A moment later, its thruster fires and it flies up off the top of the screen.
+
+    If another session needs you while it's flying off, it turns around and comes back down.
+  - **What the card shows:** each waiting session's title, what it's asking for, how long it has waited and its project. With more than four waiting, it lists four and adds *+N more*.
+  - **Click a session** on the card to jump to the window it runs in, just like a session tile (see *Click a session* below).
+  - **×** sends it flying off straight away, until a *different* session needs you. The ones you dismissed don't bring it back.
+  - **Move it** by dragging the robot or the card. The spot is remembered, and the card grows upward from there, so the robot stays where you put it. It starts in the bottom-right corner, floats above other windows on every Space, and never takes keyboard focus.
+  - **Show hovering assistant** (in either right-click menu, on by default) turns it off or on. The choice is remembered.
+  - It works whether the floating panel is shown or hidden.
 - **Show floating widget** (in either right-click menu) hides or shows the floating panel; the menu bar icon stays either way. The choice is remembered, so if you prefer the menu bar alone, the panel stays hidden on the next launch.
 - **Move** it by dragging anywhere on it; the position is remembered. It grows and shrinks to fit, keeping its top edge in place.
 - **Appearance** follows macOS Light/Dark mode: a solid near-white or near-black card, switching live when the system does.
 - **Monitor icons** show each session's state: green with lines of script typing and scrolling while it works, flashing yellow with a `!` when it needs you, dark with a blinking prompt when idle. Sub-agents get small purple ones, and the header icon shows the overall state.
 - **Chevron** (top right) switches between full and compact. Compact shows only sessions that are working or need you, the two limit bars, and the top three projects.
-- **Right-click** for *About ccwidget*, compact/expand, the floating panel's opacity, *Show floating widget*, *Open full dashboard* (opens `ccwatch.py` in a new iTerm window, or Terminal if iTerm isn't installed; macOS asks once for permission), and *Quit ccwidget*.
+- **Right-click** for *About ccwidget*, compact/expand, the floating panel's opacity, *Show floating widget*, *Show hovering assistant*, *Open full dashboard* (opens `ccwatch.py` in a new iTerm window, or Terminal if iTerm isn't installed; macOS asks once for permission), and *Quit ccwidget*.
 - **About ccwidget** (top of either right-click menu) opens a small window with:
   - the author's avatar, name and email (click the email to write one);
   - the version, plus a *dev build* tag when the app runs the `ccwatch.py` beside it instead of a bundled copy.
@@ -335,11 +348,12 @@ Tunables are constants at the top of `ccwatch.py`:
 | Clicking a session only brings the app forward | The exact tab or window wasn't found, or permission was declined. Run `python3 ccwatch.py --focus <pid>` to see what it found. Allow ccwidget under System Settings → Privacy & Security → Automation (and Accessibility for JetBrains IDEs). |
 | Widget shows a yellow error line | That's the last error from `ccwatch.py --json`. Run `python3 ccwatch.py --json --once` in this folder to see it in full. |
 | Floating panel is gone | It may be hidden: right-click the menu bar icon and tick *Show floating widget*. |
+| Hovering assistant never appears | Check that *Show hovering assistant* is ticked in the right-click menu, and that the session shows as needing you in the widget (see *"Needs you" never appears*). If you closed it with ×, it stays away until a different session needs you. |
 | Menu bar icon is missing | The menu bar is full, so it sits behind the notch. Quit or hide a few other menu bar apps, or ⌘-drag icons to make room. |
 | Packaged app says "ccwatch.py not found inside or next to ccwidget.app" | The app was built with `build-widget.sh`, not `package.sh`, and then moved away from this folder. Use the app from `dist/`, or rebuild with `./package.sh`. |
 | Packaged app shows "couldn't start python3" | No Python 3 at `/opt/homebrew/bin`, `/usr/local/bin` or `/usr/bin`. Install it (Homebrew, python.org, or the Command Line Tools via `xcode-select --install`), then reopen the app. |
 | "ccwidget" Not Opened, "Apple could not verify…" on another Mac | The app is ad-hoc signed and was downloaded or received, so it's quarantined. Click **Done**, then System Settings → Privacy & Security → **Open Anyway**, or run `xattr -dr com.apple.quarantine /Applications/ccwidget.app`. See `Open Me First.txt` and *Signing* under Packaging. |
-| Widget is off-screen after unplugging a display | `defaults delete local.ccwatch.widget` then reopen it; it starts in the top-right corner. |
+| Widget or assistant is off-screen after unplugging a display | `defaults delete local.ccwatch.widget` then reopen it; the panel starts in the top-right corner, the assistant in the bottom-right. |
 
 To test the hook by hand:
 

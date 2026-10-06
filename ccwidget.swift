@@ -7,7 +7,8 @@
 // Build: ./build-widget.sh   (creates ccwidget.app next to ccwatch.py)
 // Drag anywhere to move · click the chevron to compact · right-click for options
 // It also lives in the menu bar: click the icon for the same view in a popover,
-// right-click it for the options menu.
+// right-click it for the options menu. While a session waits on you, a hovering
+// robot assistant holds up a card of those sessions; click one to jump to it.
 
 import AppKit
 import Combine
@@ -804,6 +805,235 @@ struct AboutView: View {
     }
 }
 
+// MARK: - Hovering assistant
+
+/// What the hovering assistant shows; AppDelegate fills it from each snapshot.
+final class AssistantModel: ObservableObject {
+    @Published var waiting: [Sess] = []
+    @Published var shown = false  // false while the panel is hidden, so the animation stops
+    @Published var leaving = false  // flying off: full thrust, no floor shadow
+}
+
+/// The assistant's head: antenna with a pulsing light, metal head, dark visor with
+/// eyes that glance down at the card and blink every few seconds. Drawn on an
+/// 84 x 66 grid; the neck runs down behind the card the robot holds.
+struct RobotHead: View {
+    let t: Double  // seconds; drives the blink and the antenna light
+    var happy = false  // ^ ^ eyes once nothing needs you
+
+    var body: some View {
+        Canvas { ctx, size in
+            ctx.scaleBy(x: size.width / 84, y: size.height / 66)
+            let outline = Color(white: 0.3)
+            let glow = Color(nsColor: .systemTeal)
+            // antenna, its light pulsing like the menu bar dot
+            ctx.fill(Path(CGRect(x: 40.8, y: 7, width: 2.4, height: 9)), with: .color(outline))
+            let pulse = 0.5 + 0.5 * sin(t * 2 * .pi / 1.2)
+            let bulb = CGRect(x: 37, y: 0, width: 10, height: 10)
+            ctx.fill(Path(ellipseIn: bulb.insetBy(dx: -4, dy: -4)), with: .color(Color(nsColor: .systemOrange).opacity(0.35 * pulse)))
+            ctx.fill(Path(ellipseIn: bulb), with: .color(Color(nsColor: .systemOrange).opacity(0.55 + 0.45 * pulse)))
+            ctx.stroke(Path(ellipseIn: bulb), with: .color(outline), lineWidth: 1.2)
+            // neck, ears, head
+            ctx.fill(Path(CGRect(x: 35, y: 56, width: 14, height: 10)), with: .color(Color(white: 0.6)))
+            for x in [5.5, 72.5] {
+                let ear = Path(roundedRect: CGRect(x: x, y: 27, width: 6, height: 17), cornerRadius: 3)
+                ctx.fill(ear, with: .color(Color(white: 0.72)))
+                ctx.stroke(ear, with: .color(outline), lineWidth: 1.2)
+            }
+            let head = Path(roundedRect: CGRect(x: 11, y: 15, width: 62, height: 44), cornerRadius: 14)
+            ctx.fill(head, with: .linearGradient(Gradient(colors: [Color(white: 0.97), Color(white: 0.74)]),
+                                                 startPoint: CGPoint(x: 42, y: 15), endPoint: CGPoint(x: 42, y: 59)))
+            ctx.stroke(head, with: .color(outline), lineWidth: 1.5)
+            let visor = Path(roundedRect: CGRect(x: 18, y: 22, width: 48, height: 29), cornerRadius: 9)
+            ctx.fill(visor, with: .color(Color(red: 0.11, green: 0.14, blue: 0.19)))
+            if happy {
+                for x in [32.0, 52.0] {
+                    var eye = Path()
+                    eye.move(to: CGPoint(x: x - 4.5, y: 36))
+                    eye.addQuadCurve(to: CGPoint(x: x + 4.5, y: 36), control: CGPoint(x: x, y: 27))
+                    ctx.stroke(eye, with: .color(glow.opacity(0.3)), style: StrokeStyle(lineWidth: 5, lineCap: .round))
+                    ctx.stroke(eye, with: .color(glow), style: StrokeStyle(lineWidth: 2.4, lineCap: .round))
+                }
+                var grin = Path()
+                grin.move(to: CGPoint(x: 35, y: 42))
+                grin.addQuadCurve(to: CGPoint(x: 49, y: 42), control: CGPoint(x: 42, y: 49))
+                ctx.stroke(grin, with: .color(glow), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                return
+            }
+            // eyes, looking down at the card; a quick blink every 3.7 s
+            let eyeH = t.truncatingRemainder(dividingBy: 3.7) < 0.13 ? 1.2 : 8.0
+            for x in [32.0, 52.0] {
+                let eye = CGRect(x: x - 3.5, y: 34 - eyeH / 2, width: 7, height: eyeH)
+                ctx.fill(Path(ellipseIn: eye.insetBy(dx: -2.5, dy: -2.5)), with: .color(glow.opacity(0.25)))
+                ctx.fill(Path(roundedRect: eye, cornerRadius: min(3.5, eyeH / 2)), with: .color(glow))
+            }
+            var mouth = Path()
+            mouth.move(to: CGPoint(x: 37, y: 43))
+            mouth.addQuadCurve(to: CGPoint(x: 47, y: 43), control: CGPoint(x: 42, y: 47))
+            ctx.stroke(mouth, with: .color(glow), style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
+        }
+    }
+}
+
+/// A robot mitt gripping the top edge of the card.
+struct RobotHand: View {
+    var body: some View {
+        RoundedRectangle(cornerRadius: 5)
+            .fill(LinearGradient(colors: [Color(white: 0.95), Color(white: 0.72)], startPoint: .top, endPoint: .bottom))
+            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color(white: 0.3), lineWidth: 1.2))
+            .overlay(HStack(spacing: 3.5) {  // fingers
+                ForEach(0..<3, id: \.self) { _ in Capsule().fill(Color(white: 0.3)).frame(width: 1, height: 5) }
+            }.offset(y: 2))
+            .frame(width: 18, height: 14)
+    }
+}
+
+/// The thruster flame that keeps the robot in the air; it flickers, and burns
+/// twice as long at full thrust when the robot flies off.
+struct Thruster: View {
+    let t: Double
+    var boost = false
+
+    var body: some View {
+        let flicker = 0.75 + 0.25 * sin(t * 37) * sin(t * 23)
+        Canvas { ctx, size in
+            var flame = Path()
+            let w = size.width, h = size.height * (boost ? 1 : 0.55) * flicker
+            flame.move(to: CGPoint(x: 0, y: 0))
+            flame.addQuadCurve(to: CGPoint(x: w / 2, y: h), control: CGPoint(x: w * 0.1, y: h * 0.6))
+            flame.addQuadCurve(to: CGPoint(x: w, y: 0), control: CGPoint(x: w * 0.9, y: h * 0.6))
+            ctx.fill(flame, with: .linearGradient(
+                Gradient(colors: [Color(nsColor: .systemTeal), Color(nsColor: .systemTeal).opacity(0)]),
+                startPoint: .zero, endPoint: CGPoint(x: 0, y: h)))
+        }
+        .frame(width: boost ? 30 : 26, height: 40)
+    }
+}
+
+/// Clippy for Claude Code: a robot that hovers on the desktop, holding a card of
+/// the sessions waiting on you (a permission prompt, a question). Click one to
+/// bring its terminal or editor window forward; × hides it until another session
+/// needs you. AppDelegate shows it only while something is waiting.
+struct AssistantView: View {
+    @ObservedObject var model: AssistantModel
+    var onDismiss: () -> Void = {}
+    var onSize: (CGSize) -> Void = { _ in }
+
+    static let cardWidth: CGFloat = 290
+
+    var body: some View {
+        Group {
+            if model.shown {
+                TimelineView(.animation(minimumInterval: 1.0 / 30)) { tl in
+                    content(t: tl.date.timeIntervalSinceReferenceDate)
+                }
+            }
+        }
+        .fixedSize()
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { onSize($0) }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+    }
+
+    func content(t: Double) -> some View {
+        let bob = sin(t * 2 * .pi / 2.6) * 4  // the hover: up and down every 2.6 s
+        return VStack(spacing: 0) {
+            ZStack(alignment: .top) {
+                RoundedRectangle(cornerRadius: 12)  // shoulders; the rest of the body is behind the card
+                    .fill(LinearGradient(colors: [Color(white: 0.93), Color(white: 0.7)], startPoint: .top, endPoint: .bottom))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color(white: 0.3), lineWidth: 1.5))
+                    .frame(width: 128, height: 40)
+                    .padding(.top, 60)
+                RobotHead(t: t, happy: model.waiting.isEmpty)
+                    .frame(width: 84, height: 66)
+                    .rotationEffect(.degrees(sin(t * 0.9) * 4), anchor: .bottom)
+                VStack(spacing: -8) {
+                    card(frame: Int(t * 10))
+                    Thruster(t: t, boost: model.leaving).zIndex(-1)
+                }
+                .padding(.top, 72)
+                HStack {
+                    RobotHand()
+                    Spacer()
+                    RobotHand()
+                }
+                .frame(width: 136)
+                .padding(.top, 66)
+            }
+            .offset(y: bob)
+            Ellipse()  // shadow on the "floor", tighter and darker as the robot dips
+                .fill(Color.black.opacity(0.16 - bob * 0.015))
+                .frame(width: 150 - bob * 5, height: 9)
+                .blur(radius: 2)
+                .opacity(model.leaving ? 0 : 1)
+                .animation(.easeOut(duration: 0.3), value: model.leaving)
+                .padding(.top, 4)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(width: Self.cardWidth + 24)
+    }
+
+    func card(frame: Int) -> some View {
+        let waiting = model.waiting
+        let shown = Array(waiting.prefix(4))
+        return VStack(alignment: .leading, spacing: 5) {
+            if waiting.isEmpty {  // the last one was just answered; the robot is about to fly off
+                HStack(spacing: 7) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 18))
+                        .foregroundColor(Palette.busy)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("All caught up").font(.system(size: 12.5, weight: .semibold))
+                        Text("Nothing needs you right now").font(.system(size: 10)).foregroundColor(Palette.dim)
+                    }
+                }
+                .padding(.vertical, 2)
+            } else {
+                HStack(spacing: 6) {
+                    Text("NEEDS YOU")
+                        .font(.system(size: 10.5, weight: .heavy, design: .rounded))
+                        .tracking(1.3)
+                        .foregroundColor(Palette.warn)
+                    Text("\(waiting.count)")
+                        .font(.system(size: 10, weight: .bold))
+                        .monospacedDigit()
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Palette.warn.opacity((frame / 6) % 2 == 0 ? 0.95 : 0.6)))
+                        .foregroundColor(.black)
+                    Spacer()
+                    Button(action: onDismiss) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(Palette.dim)
+                            .frame(width: 16, height: 16)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Hide until another session needs you")
+                }
+                ForEach(Array(shown.enumerated()), id: \.offset) { _, s in
+                    SessionRow(s: s, frame: frame, compact: false)
+                }
+                if waiting.count > shown.count {
+                    Text("+\(waiting.count - shown.count) more").font(.system(size: 9.5)).foregroundColor(Palette.dim)
+                }
+                Text("Click a session to jump to its window")
+                    .font(.system(size: 9.5))
+                    .foregroundColor(Palette.dim)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 14)  // clear of the hands
+        .padding(.bottom, 10)
+        .frame(width: Self.cardWidth, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Palette.background))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke((waiting.isEmpty ? Palette.busy : Palette.warn).opacity(0.7), lineWidth: 1.5))
+        .shadow(color: .black.opacity(0.25), radius: 8, y: 3)
+        .foregroundColor(.primary)
+    }
+}
+
 // MARK: - App
 
 
@@ -845,7 +1075,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // works whichever subview is under the pointer.
         NSEvent.addLocalMonitorForEvents(matching: [.rightMouseDown, .leftMouseDown]) { [weak self] event in
             guard let self = self, let window = event.window, let view = window.contentView,
-                  window === self.panel || window === self.popover.contentViewController?.view.window,
+                  window === self.panel || window === self.assistantPanel
+                    || window === self.popover.contentViewController?.view.window,
                   event.type == .rightMouseDown || event.modifierFlags.contains(.control) else { return event }
             NSMenu.popUpContextMenu(self.buildMenu(), with: event, for: view)
             return nil
@@ -860,7 +1091,136 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             panel.orderFrontRegardless()
         }
         setUpStatusItem()
+        setUpAssistant()
         feed.start()
+    }
+
+    // MARK: Hovering assistant
+
+    let assistant = AssistantModel()
+    var assistantPanel: WidgetPanel!
+    private var assistantVisible = false
+    private var dismissed = Set<Int>()  // pids hidden with ×, until they stop waiting
+    private var assistantWatch: AnyCancellable?
+
+    func setUpAssistant() {
+        let p = WidgetPanel(contentRect: NSRect(x: 0, y: 0, width: AssistantView.cardWidth + 24, height: 200),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        p.level = .floating
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        p.isMovableByWindowBackground = true
+        p.backgroundColor = .clear
+        p.isOpaque = false
+        p.hasShadow = false  // the card and the floor draw their own
+        p.hidesOnDeactivate = false
+        let host = NSHostingView(rootView: AssistantView(model: assistant, onDismiss: { [weak self] in
+            guard let self = self else { return }
+            self.dismissed = Set(self.assistant.waiting.map { $0.pid ?? 0 })
+            self.setAssistant(visible: false)
+        }, onSize: { [weak self] in self?.fitAssistant($0) }))
+        host.sizingOptions = []
+        p.contentView = host
+        assistantPanel = p
+        if !p.setFrameUsingName("assistant"), let screen = NSScreen.main {  // first run: bottom-right corner
+            let v = screen.visibleFrame
+            p.setFrameOrigin(NSPoint(x: v.maxX - p.frame.width - 24, y: v.minY + 24))
+        }
+        if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(p.frame) }), let screen = NSScreen.main {
+            let v = screen.visibleFrame  // quit mid-flight, or its display was unplugged
+            p.setFrameOrigin(NSPoint(x: v.maxX - p.frame.width - 24, y: v.minY + 24))
+        }
+        p.setFrameAutosaveName("assistant")
+        assistantWatch = feed.$snap.receive(on: RunLoop.main).sink { [weak self] in self?.updateAssistant($0) }
+    }
+
+    private var assistantSize = CGSize.zero
+
+    /// Resize to the content, growing upward so the robot stays where it hovers.
+    func fitAssistant(_ size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        assistantSize = size
+        var f = assistantPanel.frame
+        guard abs(f.width - size.width) > 0.5 || abs(f.height - size.height) > 0.5 else { return }
+        f.size = size
+        assistantPanel.setFrame(f, display: true)
+    }
+
+    /// Shown while any session waits on you, unless switched off in the menu or
+    /// dismissed with × (it comes back when a different session starts waiting).
+    func updateAssistant(_ snap: Snapshot?) {
+        let waiting = (snap?.sessions ?? []).filter { $0.state == "wait" }
+        let pids = Set(waiting.map { $0.pid ?? 0 })
+        dismissed.formIntersection(pids)
+        assistant.waiting = waiting
+        let enabled = UserDefaults.standard.object(forKey: "assistant") as? Bool ?? true
+        // a short "All caught up" when the last one was answered; otherwise straight off
+        setAssistant(visible: enabled && !pids.subtracting(dismissed).isEmpty, pause: waiting.isEmpty ? 1.2 : 0)
+    }
+
+    /// Fades in where it was left. It leaves by flying up off the top of the screen,
+    /// after `pause` seconds of "All caught up" when the last session was just answered.
+    func setAssistant(visible: Bool, pause: Double = 0) {
+        guard visible != assistantVisible else { return }
+        assistantVisible = visible
+        let p = assistantPanel!
+        if !visible {
+            DispatchQueue.main.asyncAfter(deadline: .now() + pause) { [weak self] in
+                guard let self = self, !self.assistantVisible, self.flightHome == nil else { return }
+                self.flyAway()
+            }
+            return
+        }
+        assistant.leaving = false
+        assistant.shown = true
+        if let home = flightHome {  // a session needs you mid-flight: fly back down
+            flightHome = nil
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.4
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                p.animator().setFrame(NSRect(origin: home, size: p.frame.size), display: true)
+                p.animator().alphaValue = 1
+            }) { [weak self] in  // the card may have changed size on the way down
+                guard let self = self else { return }
+                self.fitAssistant(self.assistantSize)
+            }
+        } else if !p.isVisible {
+            p.alphaValue = 0
+            p.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { $0.duration = 0.3; p.animator().alphaValue = 1 }
+        }  // else it was still showing "All caught up": just carry on
+    }
+
+    private var flightHome: NSPoint?  // where the robot hovered before it flew off
+
+    /// Full thrust and lift-off: slow at first, then faster, until it's past the top
+    /// of the screen. Then it's hidden and put back on its spot for next time.
+    private func flyAway() {
+        let p = assistantPanel!
+        let home = p.frame.origin
+        flightHome = home
+        assistant.leaving = true
+        let top = (p.screen ?? NSScreen.main)?.frame.maxY ?? home.y + 1200
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 1.1
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.5, 0, 0.9, 0.6)
+            p.animator().setFrame(NSRect(origin: NSPoint(x: home.x, y: top + 40), size: p.frame.size), display: true)
+            p.animator().alphaValue = 0.3  // gone either way if another display sits above
+        }) { [weak self] in
+            guard let self = self, !self.assistantVisible else { return }  // called back meanwhile
+            p.orderOut(nil)
+            p.setFrameOrigin(home)  // also re-saves the spot, which the flight overwrote
+            p.alphaValue = 1
+            self.flightHome = nil
+            self.assistant.shown = false
+            self.assistant.leaving = false
+        }
+    }
+
+    @objc func toggleAssistant() {
+        let on = !(UserDefaults.standard.object(forKey: "assistant") as? Bool ?? true)
+        UserDefaults.standard.set(on, forKey: "assistant")
+        dismissed = []
+        updateAssistant(feed.snap)
     }
 
     // MARK: Menu bar icon
@@ -1132,6 +1492,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let floating = item("Show floating widget", #selector(toggleFloating))
         floating.state = panel.isVisible ? .on : .off
         menu.addItem(floating)
+        let helper = item("Show hovering assistant", #selector(toggleAssistant))
+        helper.state = UserDefaults.standard.object(forKey: "assistant") as? Bool ?? true ? .on : .off
+        menu.addItem(helper)
         menu.addItem(item("Open full dashboard", #selector(openDashboard)))
         menu.addItem(.separator())
         menu.addItem(item("Quit ccwidget", #selector(quit)))
