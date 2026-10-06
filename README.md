@@ -41,6 +41,8 @@ python3 ccwatch.py          # live dashboard
 python3 ccwatch.py --once   # one-shot plain-text snapshot, projects included (good for scripts / ssh)
 python3 ccwatch.py --json   # one JSON snapshot per second (feeds the desktop widget); add --once for just one
 python3 ccwatch.py --focus <pid>   # bring the terminal/editor window running that claude process to the front
+python3 ccwatch.py --install       # add the hook and status line capture to ~/.claude (--dry-run to preview)
+python3 ccwatch.py --doctor        # check every data source and say what's missing
 ./build-widget.sh && open ccwidget.app   # floating desktop widget (see below)
 ./package.sh                             # self-contained ccwidget.app + .zip + .dmg in dist/ (see Packaging)
 ```
@@ -48,6 +50,8 @@ python3 ccwatch.py --focus <pid>   # bring the terminal/editor window running th
 On startup it shows "scanning today's Claude transcripts…" for a second or two while it reads today's history; after that it only reads what's new.
 
 Requirements: macOS (tested; Linux should work but hasn't been tried), Python 3.8+ (standard library only, no `pip install`), and `jq` for the hook and status line. Run it in its own terminal tab or split pane; it's read-only and safe to leave open.
+
+**First time on a Mac:** run `python3 ccwatch.py --install` once. It wires up the two things ccwatch can't read on its own: the hook that says when a session needs you, and the status line capture that carries plan limits, context and cost. See [Setup](#setup).
 
 | Key | Action |
 |---|---|
@@ -59,18 +63,19 @@ Requirements: macOS (tested; Linux should work but hasn't been tried), Python 3.
 
 | File | Role |
 |---|---|
-| `ccwatch.py` | The dashboard. Reads local files only; never writes anything. |
+| `ccwatch.py` | The dashboard. Reads local files only; the only things it deletes are stale files in its own `~/.cache/ccwatch`. `--install` / `--uninstall` are the only modes that edit anything else. |
 | `ccwatch-hook.sh` | Hook script that records when a session is blocked waiting on you. |
 | `ccwidget.swift` | Source of the floating desktop widget. |
 | `build-widget.sh` | Compiles `ccwidget.swift` into `ccwidget.app` in this folder (dev build; runs the `ccwatch.py` beside it). |
 | `package.sh` | Builds a self-contained, universal `dist/ccwidget.app` with `ccwatch.py` inside, plus a `.zip` and a `.dmg`. |
 | `dist/` | Output of `package.sh` (git-ignored, like `ccwidget.app`). |
-| `VERSION` | The project version (`1.1.0`). Shown in *About ccwidget* and used by `package.sh` as the default version. |
+| `VERSION` | The project version (`1.2.0`). Shown in *About ccwidget* and used by `package.sh` as the default version. |
 | `avatar.png` | The author's picture for *About ccwidget*, copied into the app at build time. |
 | `author.conf` | Author name and email for *About ccwidget*. |
 | `LICENSE` | MIT license. |
-| `~/.claude/statusline-command.sh` | Your status line script, with a few lines added that save Claude Code's status data for the dashboard. |
-| `~/.claude/settings.json` | Hook entries that run `ccwatch-hook.sh` (added alongside the existing iTerm `cc-status` hooks). |
+| `tests/` | Unit tests, standard library only: `python3 -m unittest discover -s tests`. |
+| `~/.claude/statusline-command.sh` | Your status line script, with a few lines added that save Claude Code's status data for the dashboard (or `~/.claude/ccwatch-statusline.sh` if you had none). |
+| `~/.claude/settings.json` | Hook entries that run `ccwatch-hook.sh`, added alongside any hooks you already have. |
 
 ## Desktop widget
 
@@ -115,8 +120,18 @@ open ccwidget.app
 - **Move** it by dragging anywhere on it; the position is remembered. It grows and shrinks to fit, keeping its top edge in place.
 - **Appearance** follows macOS Light/Dark mode: a solid near-white or near-black card, switching live when the system does.
 - **Monitor icons** show each session's state: green with lines of script typing and scrolling while it works, flashing yellow with a `!` when it needs you, dark with a blinking prompt when idle. Sub-agents get small purple ones, and the header icon shows the overall state.
+- **Session rows** show a small context-window gauge (green, yellow from 50%, red from 80%: time to `/compact`). In compact mode it only appears from 80%. Hover a row for its model, uptime, context and cost.
+- **Right-click a session** (in the panel, the popover or the assistant's card) for *Jump to Window*, *Copy Resume Command* (`cd '<project>' && claude --resume <id>`, ready to paste), *Reveal Project in Finder* and *Reveal Transcript in Finder*, above the usual menu.
+- **Notifications** (right-click menu → *Notifications*):
+  - *When a Long Turn Finishes* (on): a session that worked for 2 minutes or more goes idle. Change the threshold with `defaults write local.ccwatch.widget notifyAfter -int <seconds>`.
+  - *When a Session Needs You* (off, since the hovering assistant covers it).
+  - *Plan Limit Warnings* (on): a limit window crosses 80%, 95% or 100%, once per window, even across restarts.
+
+  macOS asks for permission with the first one. Clicking a session's notification jumps to its window.
+- **Global shortcuts** (on by default; toggle with *Global Shortcuts* in the menu): **⌃⌥⌘J** jumps to the session that has waited longest, or opens the popover when none is waiting; **⌃⌥⌘W** shows or hides the floating panel. They need no Accessibility permission. If another app already uses one, that one just doesn't register.
+- **Set-up prompt:** when the hook or the status line capture is missing (say, on a new Mac), a yellow row at the top says what's missing, with a *Set up…* button. It shows what will change in `~/.claude` and asks before doing it. The same is in the menu as *Set Up Hooks & Status Line…*, next to *Run Diagnostics…* (`ccwatch.py --doctor`).
 - **Chevron** (top right) switches between full and compact. Compact shows only sessions that are working or need you, the two limit bars, and the top three projects.
-- **Right-click** for *About ccwidget*, compact/expand, the floating panel's opacity, *Show floating widget*, *Show hovering assistant*, *Open full dashboard* (opens `ccwatch.py` in a new iTerm window, or Terminal if iTerm isn't installed; macOS asks once for permission), and *Quit ccwidget*.
+- **Right-click** for *About ccwidget*, compact/expand, the floating panel's opacity, *Show floating widget*, *Show hovering assistant*, *Notifications*, *Global Shortcuts*, *Open full dashboard* (opens `ccwatch.py` in a new iTerm window, or Terminal if iTerm isn't installed; macOS asks once for permission), *Set Up Hooks & Status Line…*, *Run Diagnostics…* and *Quit ccwidget*.
 - **About ccwidget** (top of either right-click menu) opens a small window with:
   - the author's avatar, name and email (click the email to write one);
   - the version, plus a *dev build* tag when the app runs the `ccwatch.py` beside it instead of a bundled copy.
@@ -151,7 +166,7 @@ open ccwidget.app
 
 It has no Dock icon or app menu, only the menu bar icon. To stop it, choose *Quit ccwidget* from either right-click menu, or run `pkill -f ccwidget.app`.
 
-How it works: the widget runs `ccwatch.py --json` as a child process and redraws from each snapshot, so it shows exactly what the terminal dashboard does and all scanning stays in one place. It uses the first `python3` it finds in `/opt/homebrew/bin`, `/usr/local/bin` or `/usr/bin` (apps opened from Finder don't get your shell's `PATH`), and runs the `ccwatch.py` bundled inside the app if there is one (a `package.sh` build), otherwise the one next to the app (a `build-widget.sh` build), so keep a dev build in this folder, or set `CCWATCH_PY`. If the feed stops, the widget shows the error and restarts it after three seconds. For a dev build, rebuild after changing `ccwidget.swift`; changes to `ccwatch.py` only need the widget restarted. A packaged app needs `./package.sh` again for either.
+How it works: the widget runs `ccwatch.py --json` as a child process and redraws from each snapshot, so it shows exactly what the terminal dashboard does and all scanning stays in one place. It uses the first `python3` it finds in `/opt/homebrew/bin`, `/usr/local/bin` or `/usr/bin` (apps opened from Finder don't get your shell's `PATH`), and runs the `ccwatch.py` bundled inside the app if there is one (a `package.sh` build), otherwise the one next to the app (a `build-widget.sh` build), so keep a dev build in this folder, or set `CCWATCH_PY`. If the feed stops, the widget shows the error and restarts it, after 3 seconds at first and backing off to a minute while it keeps failing. It animates at 10 fps only while a session is working or needs you, at 2 fps when all are idle, and not at all while the panel or popover is hidden. For a dev build, rebuild after changing `ccwidget.swift`; changes to `ccwatch.py` only need the widget restarted. A packaged app needs `./package.sh` again for either.
 
 ## Packaging
 
@@ -188,7 +203,7 @@ So a packaged app always runs the copy it was built with. A dev build from `buil
 **Installing on a Mac:** open the dmg and drag `ccwidget.app` to Applications, then open it.
 
 - **Python 3.8+:** the target Mac needs it at `/opt/homebrew/bin`, `/usr/local/bin` or `/usr/bin`. A fresh Mac's `/usr/bin/python3` asks to install the Command Line Tools the first time; accept, then reopen the app.
-- **Hook and status line:** these are separate. Without them the widget still lists sessions and today's projects, but shows no "needs you" state and no plan-limit bars. To set them up on another Mac, copy `ccwatch-hook.sh` out of the app (`/Applications/ccwidget.app/Contents/Resources/`) to a fixed place such as `~/.claude/`. Then add the hook entries and status line block described above, pointing at that copy.
+- **Hook and status line:** these are separate. Without them the widget still lists sessions and today's projects, but shows no "needs you" state and no plan-limit bars. Click *Set up…* in the widget (or *Set Up Hooks & Status Line…* in its menu). The app copies its `ccwatch-hook.sh` to `~/.claude/`, so later updates of the app don't break the path, then adds the hook entries and the status line capture (see [Setup](#setup)).
 
 **Signing:** by default the app is signed ad-hoc. That is fine on the Mac that built it. A copy received any other way, such as WhatsApp, a browser download, email or AirDrop, is marked as quarantined. macOS then blocks its first launch with *"ccwidget" Not Opened — Apple could not verify "ccwidget" is free of malware…*. The app isn't damaged; macOS just can't check who made it. The recipient should click **Done**, not *Move to Trash*, and allow it once in one of two ways:
 - *System Settings → Privacy & Security*, scroll to "ccwidget was blocked…", then **Open Anyway**, enter the password, and **Open Anyway** again (macOS 15 and later no longer offer right-click → Open for this);
@@ -207,6 +222,25 @@ SIGN_ID="Developer ID Application: Your Name (TEAMID)" NOTARY_PROFILE=ccwatch ./
 ```
 
 With `SIGN_ID`, the app is signed with the hardened runtime and the Apple Events entitlement that click-to-focus and *Open full dashboard* need. The Developer ID and notarization path hasn't been tested yet, since only ad-hoc signing was available when this was written.
+
+## Setup
+
+```sh
+python3 ccwatch.py --install --dry-run   # show what would change
+python3 ccwatch.py --install             # do it
+python3 ccwatch.py --doctor              # check everything
+python3 ccwatch.py --uninstall           # undo it (also takes --dry-run)
+```
+
+`--install` does three things, and running it again changes nothing:
+
+1. **Hook entries** in `~/.claude/settings.json` for the 12 events in the table under *Waiting hook* below, each running `ccwatch-hook.sh` in the background. Your other hooks are left alone. Earlier ccwatch entries (for example, ones pointing at an old path) are replaced. Run from inside a packaged app, it first copies the hook to `~/.claude/ccwatch-hook.sh`.
+2. **Status line capture.** If your status line runs a script file with an `input=$(cat)` line, the capture block (marked `# ccwatch:`) goes right after it. With no status line at all, it creates `~/.claude/ccwatch-statusline.sh` (the model and context %, plus the capture) and uses that. An inline status line command can't be edited safely, so it prints the block for you to add.
+3. **Backups** before the first edit of each file: `settings.json.bak-ccwatch` and `<status line script>.bak`. An existing backup is never overwritten, so it stays the copy from before ccwatch.
+
+It warns if `jq` is missing, since the hook and status line need it. Running sessions may need a restart to pick up the hooks.
+
+`--doctor` checks Python, `jq`, the session registry, transcripts, every hook entry and its script, the status line, how fresh the newest capture is, and leftover "needs you" flags. It prints ✓ / ✗ / ! with a hint for each problem, and exits non-zero when something is broken.
 
 ## Reading the dashboard
 
@@ -288,6 +322,7 @@ ccwatch combines five local data sources, polled once a second (today's token to
 ```
 
 - **Live sessions**: a session file only counts if its process is still alive, so crashed sessions disappear on their own.
+- **Tidying up**: once an hour, ccwatch deletes status line captures older than 8 days and "needs you" flags more than a day old whose session has gone. Both live in its own `~/.cache/ccwatch`.
 - **Transcripts**: only the last 256 KB is re-read, and only when the file grows. Today's token totals and project stats come from one incremental scan of every transcript changed today, which picks up from where the last scan stopped. A session belongs to the directory it was in at its first message today.
 - **Status line capture**: Claude Code passes the status line command a JSON blob that includes `rate_limits`, `cost` and `context_window`. That data isn't stored anywhere else, so the status line script saves it per session. Plan limits come from whichever session reported most recently.
 - **Limit windows aren't hard-coded**: `rate_limits` gives each window as a key with `used_percentage` and `resets_at`, but no length. ccwatch reads the length from the key name, so if Anthropic changes the session window, it just follows:
@@ -335,8 +370,15 @@ Tunables are constants at the top of `ccwatch.py`:
 | `PROJECTS_STACKED` | `5` | Lines of the projects panel when it's stacked below usage |
 | `SUB_ACTIVE_SECS` | `30` | How recently a sub-agent must have written to count as active |
 | `MAX_CARD_W` | `80` | Maximum card width on wide terminals |
+| `PRUNE_INTERVAL` | `3600` | Seconds between clean-ups of `~/.cache/ccwatch` |
+| `CAPTURE_MAX_AGE` | `8 days` | Status line captures older than this are deleted |
+| `STATE_MAX_AGE` | `1 day` | "Needs you" flags of ended sessions older than this are deleted |
+
+Widget settings live in its defaults (`defaults read local.ccwatch.widget`). Most are set from the right-click menu; `notifyAfter` (seconds, default 120) is set with `defaults write`.
 
 ## Troubleshooting
+
+Start with `python3 ccwatch.py --doctor` (or *Run Diagnostics…* in the widget's menu). It checks most of the rows below.
 
 | Symptom | Check |
 |---|---|
@@ -347,6 +389,8 @@ Tunables are constants at the top of `ccwatch.py`:
 | "Needs you" stays after you've answered | Give it a few seconds. If it persists, `rm ~/.cache/ccwatch/state/<session>.json` clears it. |
 | Clicking a session only brings the app forward | The exact tab or window wasn't found, or permission was declined. Run `python3 ccwatch.py --focus <pid>` to see what it found. Allow ccwidget under System Settings → Privacy & Security → Automation (and Accessibility for JetBrains IDEs). |
 | Widget shows a yellow error line | That's the last error from `ccwatch.py --json`. Run `python3 ccwatch.py --json --once` in this folder to see it in full. |
+| No notifications | Check the *Notifications* submenu, then System Settings → Notifications → ccwidget. An ad-hoc signed build may need the permission granted again after a rebuild. |
+| ⌃⌥⌘J / ⌃⌥⌘W do nothing | *Global Shortcuts* must be ticked in the menu. Another app may already hold the shortcut. |
 | Floating panel is gone | It may be hidden: right-click the menu bar icon and tick *Show floating widget*. |
 | Hovering assistant never appears | Check that *Show hovering assistant* is ticked in the right-click menu, and that the session shows as needing you in the widget (see *"Needs you" never appears*). If you closed it with ×, it stays away until a different session needs you. |
 | Menu bar icon is missing | The menu bar is full, so it sits behind the notch. Quit or hide a few other menu bar apps, or ⌘-drag icons to make room. |
@@ -365,8 +409,8 @@ rm ~/.cache/ccwatch/state/test.json
 
 ## Uninstall
 
-1. Remove the hook entries whose command contains `ccwatch-hook.sh` from `~/.claude/settings.json`, or restore the backup taken before they were added: `cp ~/.claude/settings.json.bak-ccwatch ~/.claude/settings.json`. Only restore the backup if you haven't changed settings since; otherwise remove the entries by hand.
-2. Delete the block marked `# ccwatch:` near the top of `~/.claude/statusline-command.sh`, or restore `~/.claude/statusline-command.sh.bak`.
+1. Run `python3 ccwatch.py --uninstall` (`--dry-run` first to preview). It removes the hook entries whose command contains `ccwatch-hook.sh` and the `# ccwatch:` block from your status line script, or the whole `ccwatch-statusline.sh` status line if `--install` created it. Restoring the backups (`~/.claude/settings.json.bak-ccwatch`, `<status line script>.bak`) also works, but only if you haven't changed those files since.
+2. Delete `~/.claude/ccwatch-hook.sh` if `--install` copied it there from a packaged app.
 3. Delete the saved data: `rm -rf ~/.cache/ccwatch`.
 4. If you used the widget: quit it, remove it from Login Items, delete `ccwidget.app` (and `/Applications/ccwidget.app` if you installed a packaged copy), and run `defaults delete local.ccwatch.widget` to forget its position and settings.
 
