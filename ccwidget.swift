@@ -22,6 +22,13 @@ struct Snapshot: Decodable {
     var limitsStale: String?
     var today: Today?
     var projects: Projects?
+    var setup: Setup?
+}
+
+/// Whether the hook ("needs you") and the status line capture (limits, ctx, cost) are set up.
+struct Setup: Decodable {
+    var hooks: Bool
+    var statusline: Bool
 }
 
 struct Sess: Decodable {
@@ -195,6 +202,21 @@ final class Feed: ObservableObject {
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         try? p.run()
+    }
+
+    /// Run ccwatch.py with these arguments (e.g. --doctor) and return everything it printed.
+    static func run(_ args: [String]) -> String {
+        guard let script = locateScript() else { return "ccwatch.py not found inside or next to ccwidget.app" }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: locatePython())
+        p.arguments = ["-B", script] + args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return "couldn't start python3: \(error.localizedDescription)" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func stop() {
@@ -741,6 +763,33 @@ struct ProjectsSection: View {
     }
 }
 
+/// Shown while the hook or the status line capture is missing, e.g. on a new Mac.
+struct SetupPrompt: View {
+    let setup: Setup
+
+    var body: some View {
+        let what = setup.hooks ? "Plan limits aren't set up"
+            : setup.statusline ? "“Needs you” alerts aren't set up"
+            : "“Needs you” alerts and limits aren't set up"
+        HStack(spacing: 6) {
+            Image(systemName: "wrench.and.screwdriver").foregroundColor(Palette.warn)
+            Text(what).foregroundColor(.primary.opacity(0.8)).lineLimit(1)
+            Spacer(minLength: 4)
+            Button {
+                NSApp.sendAction(#selector(AppDelegate.runSetup), to: NSApp.delegate, from: nil)
+            } label: {
+                Text("Set up…").font(.system(size: 10, weight: .semibold)).foregroundColor(Palette.accent)
+            }
+            .buttonStyle(.plain)
+            .help("Add the ccwatch hook and status line capture to ~/.claude (shows the changes first)")
+        }
+        .font(.system(size: 10))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Palette.warn.opacity(0.12)))
+    }
+}
+
 // MARK: - Widget
 
 /// Whether a host window is on screen; while it isn't, the widget stops animating.
@@ -774,6 +823,9 @@ struct WidgetView: View {
         let snap = feed.snap
         VStack(alignment: .leading, spacing: 7) {
             Header(snap: snap, frame: frame, compact: $compact)
+            if let setup = snap?.setup, !(setup.hooks && setup.statusline) {
+                SetupPrompt(setup: setup)
+            }
             if let snap = snap {
                 let sessions = compact
                     ? Array(snap.sessions.filter { $0.state != "idle" }.prefix(4))
@@ -1591,6 +1643,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         helper.state = UserDefaults.standard.object(forKey: "assistant") as? Bool ?? true ? .on : .off
         menu.addItem(helper)
         menu.addItem(item("Open full dashboard", #selector(openDashboard)))
+        menu.addItem(item("Set Up Hooks & Status Line…", #selector(runSetup)))
+        menu.addItem(item("Run Diagnostics…", #selector(runDoctor)))
         menu.addItem(.separator())
         menu.addItem(item("Quit ccwidget", #selector(quit)))
         return menu
@@ -1622,6 +1676,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc func revealTranscript(_ sender: NSMenuItem) {
         guard let path = (sender.representedObject as? Sess)?.transcript else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    /// Shows what `ccwatch.py --install` would change, then does it once confirmed.
+    @objc func runSetup() {
+        popover.performClose(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        let preview = Feed.run(["--install", "--dry-run"])
+        guard preview.split(separator: "\n").contains(where: { $0.hasPrefix("+ ") }) else {
+            showText("Already set up", preview)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Set up the hook and status line?"
+        alert.informativeText = "These changes are made in ~/.claude, keeping a backup of each file edited:"
+        alert.accessoryView = Self.monospaced(preview.replacingOccurrences(of: "\n(dry run: nothing written)", with: ""))
+        alert.addButton(withTitle: "Set Up")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        showText("Setup", Feed.run(["--install"]))
+    }
+
+    @objc func runDoctor() {
+        popover.performClose(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        showText("ccwatch diagnostics", Feed.run(["--doctor"]))
+    }
+
+    private func showText(_ title: String, _ text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.accessoryView = Self.monospaced(text)
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    /// Command output for an alert, in a monospaced wrapping label.
+    static func monospaced(_ text: String) -> NSView {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        label.isSelectable = true
+        label.preferredMaxLayoutWidth = 480
+        label.frame = NSRect(origin: .zero, size: NSSize(width: 480, height: label.fittingSize.height))
+        return label
     }
 
     @objc func setOpacity(_ sender: NSMenuItem) {

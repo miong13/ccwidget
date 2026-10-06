@@ -17,6 +17,9 @@ transcript changed today (tokens, time spent, prompts, edits, commits per direct
 Keys: q quit · i hide/show idle sessions · u compact/expand usage and projects panels
 Usage: ccwatch.py [--once] [--json]   (--json streams one snapshot per second; with --once, just one)
        ccwatch.py --focus <pid>        bring the terminal/editor window running that session forward
+       ccwatch.py --install [--dry-run]     add the hook and status line capture to ~/.claude
+       ccwatch.py --uninstall [--dry-run]   remove them again
+       ccwatch.py --doctor             check every data source and say what's missing
 """
 import curses
 import glob
@@ -1417,6 +1420,7 @@ def snapshot(store):
         "time": now, "sessions": sessions, "limits": limits,
         "limits_stale": f"limits as of {fmt_dur(now - store.limits_at)} ago" if stale else None,
         "today": today,
+        "setup": setup_status(),
         "projects": {"active": fmt_hm(store.ledger.active), "first": datetime.fromtimestamp(first).strftime("%H:%M") if first else "",
                      "items": items},
     }
@@ -1434,6 +1438,403 @@ def stream(single=False):
             time.sleep(DATA_INTERVAL)
     except (BrokenPipeError, KeyboardInterrupt):
         pass
+
+
+# ─── setup: --install / --uninstall / --doctor ──────────────────────────────
+
+SETTINGS = os.path.join(HOME, ".claude", "settings.json")
+HOOK_NAME = "ccwatch-hook.sh"
+MARKER = "# ccwatch:"
+OWN_STATUSLINE = os.path.join(HOME, ".claude", "ccwatch-statusline.sh")
+# event -> matcher (None: every occurrence); the table under "Waiting hook" in the README
+HOOK_EVENTS = {
+    "PermissionRequest": None, "PreToolUse": "AskUserQuestion|ExitPlanMode", "Elicitation": None,
+    "Notification": "permission_prompt|elicitation_dialog",
+    "PostToolUse": None, "PostToolUseFailure": None, "PermissionDenied": None, "ElicitationResult": None,
+    "UserPromptSubmit": None, "Stop": None, "StopFailure": None, "SessionEnd": None,
+}
+CAPTURE_BLOCK = """# ccwatch: save the latest status line input per session (cost, context, plan limits)
+cc_dir="$HOME/.cache/ccwatch/statusline"
+cc_sid=$(echo "$input" | jq -r '.session_id // empty')
+if [ -n "$cc_sid" ]; then
+  mkdir -p "$cc_dir" && echo "$input" > "$cc_dir/$cc_sid.json.tmp" && mv "$cc_dir/$cc_sid.json.tmp" "$cc_dir/$cc_sid.json"
+fi
+"""
+OWN_STATUSLINE_TEXT = """#!/bin/sh
+# Status line written by ccwatch.py --install: the model and context use, and a
+# copy of Claude Code's status data for the ccwatch dashboard and widget.
+input=$(cat)
+
+""" + CAPTURE_BLOCK + """
+echo "$input" | jq -r '"\\(.model.display_name // "Claude") · ctx \\(.context_window.used_percentage // 0 | floor)%"'
+"""
+
+
+def tilde(path):
+    return "~" + path[len(HOME):] if path.startswith(HOME + "/") else path
+
+
+def find_jq():
+    import shutil
+    for d in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"):
+        if os.access(os.path.join(d, "jq"), os.X_OK):
+            return os.path.join(d, "jq")
+    return shutil.which("jq")
+
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def write_text(path, text, like=None):
+    """Write atomically, keeping the permissions of `like` (the file being replaced)."""
+    tmp = path + ".tmp-ccwatch"
+    with open(tmp, "w") as f:
+        f.write(text)
+    try:
+        os.chmod(tmp, os.stat(like or path).st_mode & 0o7777)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def backup(path, suffix):
+    """Copy path to path+suffix, unless an earlier backup is already there."""
+    import shutil
+    if os.path.exists(path) and not os.path.exists(path + suffix):
+        shutil.copy2(path, path + suffix)
+        return path + suffix
+    return None
+
+
+def load_settings():
+    """(settings dict, error). A missing file is an empty dict; a broken one is an error."""
+    if not os.path.exists(SETTINGS):
+        return {}, None
+    d = load_json(SETTINGS)
+    if not isinstance(d, dict):
+        return None, f"{tilde(SETTINGS)} isn't valid JSON; fix it first"
+    return d, None
+
+
+def is_ours(h):
+    return isinstance(h, dict) and HOOK_NAME in str(h.get("command") or "")
+
+
+def strip_hooks(settings, prune=True):
+    """A copy of settings without any ccwatch-hook.sh entries; other hooks are left alone.
+    With prune, events left with no entries are dropped too."""
+    out = json.loads(json.dumps(settings))
+    hooks = out.get("hooks")
+    if not isinstance(hooks, dict):
+        return out
+    for ev in list(hooks):
+        entries = hooks[ev]
+        if not isinstance(entries, list):
+            continue
+        kept = []
+        for e in entries:
+            inner = e.get("hooks") if isinstance(e, dict) else None
+            if isinstance(inner, list) and any(is_ours(h) for h in inner):
+                inner = [h for h in inner if not is_ours(h)]
+                if not inner:
+                    continue
+                e = dict(e, hooks=inner)
+            kept.append(e)
+        hooks[ev] = kept
+        if prune and not kept:
+            del hooks[ev]
+    if prune and not hooks:
+        del out["hooks"]
+    return out
+
+
+def merge_hooks(settings, command):
+    """settings with exactly one ccwatch hook entry per HOOK_EVENTS event, running
+    `command`. Earlier ccwatch entries (say, from an old path) are replaced; running
+    it again changes nothing."""
+    out = strip_hooks(settings, prune=False)
+    if not isinstance(out.get("hooks"), dict):
+        out["hooks"] = {}
+    hooks = out["hooks"]
+    for ev, matcher in HOOK_EVENTS.items():
+        entry = {"hooks": [{"type": "command", "command": command, "timeout": 5, "async": True}]}
+        if matcher:
+            entry = {"matcher": matcher, **entry}
+        if not isinstance(hooks.get(ev), list):
+            hooks[ev] = []
+        hooks[ev].append(entry)
+    for ev in [ev for ev, v in hooks.items() if v == []]:
+        del hooks[ev]
+    return out
+
+
+def hook_status(settings):
+    """(events missing a ccwatch hook with the right matcher, hook script paths in use)."""
+    import shlex
+    have, paths = {}, set()
+    for ev, entries in ((settings or {}).get("hooks") or {}).items():
+        for e in entries if isinstance(entries, list) else ():
+            if not isinstance(e, dict):
+                continue
+            for h in e.get("hooks") or ():
+                if is_ours(h):
+                    have.setdefault(ev, set()).add(e.get("matcher") or None)
+                    try:
+                        paths.add(os.path.expanduser(shlex.split(h["command"])[-1]))
+                    except (ValueError, IndexError):
+                        pass
+    missing = [ev for ev, m in HOOK_EVENTS.items() if m not in have.get(ev, ())]
+    return missing, sorted(paths)
+
+
+def statusline_script(settings):
+    """The script file that statusLine.command runs, when it's a plain `[sh] <file>`."""
+    import shlex
+    cmd = (((settings or {}).get("statusLine") or {}).get("command") or "").strip()
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return None
+    if len(parts) == 2 and os.path.basename(parts[0]) in ("sh", "bash", "zsh", "dash"):
+        parts = parts[1:]
+    if len(parts) != 1:
+        return None
+    path = os.path.expanduser(os.path.expandvars(parts[0]))
+    return path if os.path.isfile(path) else None
+
+
+def hook_source():
+    """Path of the hook script the settings should point at. A packaged app's copy
+    moves with every update, so it's copied to ~/.claude first (by install())."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    bundled = os.path.join(here, HOOK_NAME)
+    if ".app/Contents/" in here + "/":
+        return bundled, os.path.join(HOME, ".claude", HOOK_NAME)
+    return bundled, bundled
+
+
+INPUT_LINE = re.compile(r"^\s*input=\$\(cat\)\s*$", re.M)
+
+
+def install(dry=False):
+    """Add the hook entries and the status line capture. Prints what it did; returns an exit code."""
+    import shlex
+    import shutil
+    say = print
+    settings, err = load_settings()
+    if err:
+        say("✗ " + err)
+        return 1
+    changes = 0
+    src, hook = hook_source()
+    if not os.path.isfile(src):
+        say(f"✗ {HOOK_NAME} not found next to ccwatch.py")
+        return 1
+
+    # 1. the hook script, copied out of an app bundle so updates don't break the path
+    if src != hook and read_text(src) != read_text(hook):
+        changes += 1
+        say(f"+ copy {HOOK_NAME} to {tilde(hook)}")
+        if not dry:
+            os.makedirs(os.path.dirname(hook), exist_ok=True)
+            shutil.copyfile(src, hook)
+    if not dry and not os.access(hook, os.X_OK):
+        os.chmod(hook, 0o755)
+
+    # 2. hook entries
+    new = merge_hooks(settings, shlex.quote(hook) if " " not in hook else '"' + hook + '"')
+    if new == settings:
+        say(f"✓ hooks already set up ({len(HOOK_EVENTS)} events)")
+    else:
+        changes += 1
+        say(f"+ add ccwatch hook entries for {len(HOOK_EVENTS)} events to {tilde(SETTINGS)}")
+
+    # 3. status line capture
+    script = statusline_script(new)
+    statusline = None  # new text for the status line script
+    if script:
+        text = read_text(script) or ""
+        if MARKER in text:
+            say(f"✓ status line {tilde(script)} already saves captures")
+        elif INPUT_LINE.search(text):
+            m = INPUT_LINE.search(text)
+            statusline = text[:m.end()] + "\n" + CAPTURE_BLOCK + text[m.end():]
+            changes += 1
+            say(f"+ add the capture block to {tilde(script)} (backup: {tilde(script)}.bak)")
+        else:
+            say(f"! {tilde(script)} has no `input=$(cat)` line; add this after it reads its input:\n")
+            say(CAPTURE_BLOCK)
+    elif not (new.get("statusLine") or {}).get("command"):
+        script, statusline = OWN_STATUSLINE, OWN_STATUSLINE_TEXT
+        new["statusLine"] = {"type": "command", "command": "sh " + shlex.quote(OWN_STATUSLINE)}
+        changes += 1
+        say(f"+ create {tilde(OWN_STATUSLINE)} and use it as the status line")
+    else:
+        say("! the status line is an inline command; make it save its input like this (the input in $input):\n")
+        say(CAPTURE_BLOCK)
+
+    if not find_jq():
+        say("! jq not found: the hook and the status line need it (brew install jq)")
+    if dry or not changes:
+        if dry:
+            say("(dry run: nothing written)" if changes else "nothing to do")
+        return 0
+
+    if new != settings:
+        os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+        b = backup(SETTINGS, ".bak-ccwatch")
+        if b:
+            say(f"  backup: {tilde(b)}")
+        write_text(SETTINGS, json.dumps(new, indent=2, ensure_ascii=False) + "\n")
+    if statusline is not None:
+        if os.path.exists(script):
+            backup(script, ".bak")
+        write_text(script, statusline)
+        if script == OWN_STATUSLINE:
+            os.chmod(script, 0o755)
+    say("done. Restart running Claude sessions if they don't pick up the hooks; status data appears after their next reply.")
+    return 0
+
+
+def uninstall(dry=False):
+    """Remove the hook entries and the status line capture block."""
+    settings, err = load_settings()
+    if err:
+        print("✗ " + err)
+        return 1
+    new = strip_hooks(settings)
+    did = []
+    if new != settings:
+        did.append(f"- remove ccwatch hook entries from {tilde(SETTINGS)}")
+    script = statusline_script(new)
+    text = read_text(script) if script else None
+    statusline = None
+    if script == OWN_STATUSLINE:
+        new.pop("statusLine", None)
+        did.append(f"- remove the status line {tilde(OWN_STATUSLINE)}")
+    elif text and MARKER in text:
+        lines = text.split("\n")
+        start = next(i for i, ln in enumerate(lines) if ln.startswith(MARKER))
+        end = next((i for i in range(start, len(lines)) if lines[i].strip() == "fi"), None)
+        if end is not None:
+            end += 1 if end + 1 < len(lines) and not lines[end + 1].strip() else 0
+            statusline = "\n".join(lines[:start] + lines[end + 1:])
+            if start > 0 and not lines[start - 1].strip() and statusline.count("\n\n\n"):
+                statusline = statusline.replace("\n\n\n", "\n\n", 1)
+            did.append(f"- remove the capture block from {tilde(script)}")
+    for line in did or ["nothing to remove"]:
+        print(line)
+    if dry or not did:
+        if dry and did:
+            print("(dry run: nothing written)")
+        return 0
+    if new != settings:
+        backup(SETTINGS, ".bak-ccwatch")
+        write_text(SETTINGS, json.dumps(new, indent=2, ensure_ascii=False) + "\n")
+    if script == OWN_STATUSLINE:
+        os.remove(OWN_STATUSLINE)
+    elif statusline is not None:
+        backup(script, ".bak")
+        write_text(script, statusline)
+    print("done. ~/.cache/ccwatch is left in place; rm -rf it to delete the saved data.")
+    return 0
+
+
+def doctor_checks():
+    """[(ok, label, hint)]: ok is True, False (broken) or None (a warning)."""
+    import platform
+    out = []
+
+    def add(ok, label, hint=""):
+        out.append((ok, label, hint))
+
+    add(sys.version_info >= (3, 8), f"Python {platform.python_version()}", "ccwatch needs Python 3.8 or later")
+    jq = find_jq()
+    add(bool(jq), f"jq at {jq}" if jq else "jq not found", "brew install jq; the hook and the status line use it")
+
+    live = set()
+    for path in glob.glob(os.path.join(SESS_DIR, "*.json")):
+        info = load_json(path) or {}
+        try:
+            pid = int(info.get("pid") or os.path.basename(path).split(".")[0])
+        except ValueError:
+            continue
+        if pid_alive(pid):
+            live.add(info.get("sessionId"))
+    add(os.path.isdir(SESS_DIR), f"session registry: {len(live)} live session{'s' * (len(live) != 1)}",
+        "~/.claude/sessions is missing; this Claude Code version may not write it")
+    add(os.path.isdir(PROJ_DIR), "transcripts in ~/.claude/projects", "no transcripts yet; start a Claude session")
+
+    settings, err = load_settings()
+    if err:
+        add(False, err)
+        settings = {}
+    missing, paths = hook_status(settings)
+    add(not missing, f"hooks for all {len(HOOK_EVENTS)} events" if not missing
+        else f"hooks missing for: {', '.join(missing)}", "run: ccwatch.py --install")
+    for p in paths:
+        add(os.access(p, os.X_OK), f"hook script {tilde(p)}",
+            "missing or not executable; run: ccwatch.py --install")
+
+    script = statusline_script(settings)
+    if not (settings.get("statusLine") or {}).get("command"):
+        add(False, "no status line configured", "run: ccwatch.py --install")
+    elif script:
+        ok = MARKER in (read_text(script) or "")
+        add(ok, f"status line {tilde(script)}" + (" saves captures" if ok else " doesn't save captures"),
+            "run: ccwatch.py --install")
+    else:
+        add(None, "status line is an inline command; can't check it saves captures",
+            "see `ccwatch.py --install --dry-run` for the block to add")
+
+    caps = [os.path.getmtime(p) for p in glob.glob(os.path.join(STATUSLINE_DIR, "*.json"))]
+    if caps:
+        age = time.time() - max(caps)
+        add(True if age < 86400 else None, f"newest status line capture {fmt_dur(age)} ago",
+            "captures update after each reply in a session")
+    else:
+        add(None, "no status line captures yet", "they appear after a session's next reply")
+
+    stale = [p for p in glob.glob(os.path.join(STATE_DIR, "*.json"))
+             if os.path.basename(p)[:-len(".json")] not in live]
+    add(True if not stale else None, f"{len(stale)} stale \"needs you\" flag{'s' * (len(stale) != 1)}",
+        "left by sessions that ended abruptly; ccwatch deletes them after a day")
+    return out
+
+
+def doctor():
+    checks = doctor_checks()
+    for ok, label, hint in checks:
+        mark = {True: "✓", False: "✗", None: "!"}[ok]
+        print(f"{mark} {label}" + (f"\n    {hint}" if hint and ok is not True else ""))
+    return 1 if any(ok is False for ok, _, _ in checks) else 0
+
+
+_setup = {"key": None, "at": 0.0, "value": None}
+
+
+def setup_status():
+    """{hooks, statusline}: whether each is set up, for the widget's set-up prompt.
+    Re-read when settings.json changes, or every 30 s."""
+    try:
+        key = os.path.getmtime(SETTINGS)
+    except OSError:
+        key = None
+    if _setup["value"] is None or key != _setup["key"] or time.time() - _setup["at"] > 30:
+        settings, _ = load_settings()
+        settings = settings or {}
+        script = statusline_script(settings)
+        captured = MARKER in (read_text(script) or "") if script else False
+        _setup.update(key=key, at=time.time(), value={
+            "hooks": not hook_status(settings)[0],
+            "statusline": captured or bool(glob.glob(os.path.join(STATUSLINE_DIR, "*.json"))),
+        })
+    return _setup["value"]
 
 
 # ─── focus: bring a session's window to the front (--focus <pid>) ───────────
@@ -1584,7 +1985,13 @@ def focus(pid):
 
 
 if __name__ == "__main__":
-    if "--focus" in sys.argv:
+    if "--install" in sys.argv:
+        sys.exit(install(dry="--dry-run" in sys.argv))
+    elif "--uninstall" in sys.argv:
+        sys.exit(uninstall(dry="--dry-run" in sys.argv))
+    elif "--doctor" in sys.argv:
+        sys.exit(doctor())
+    elif "--focus" in sys.argv:
         i = sys.argv.index("--focus")
         print(focus(int(sys.argv[i + 1])) if i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit()
               else "usage: ccwatch.py --focus <pid>")

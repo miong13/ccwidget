@@ -210,6 +210,44 @@ class PruneTest(unittest.TestCase):
                          {(sl, "new"), (sl, "live"), (st, "live")})
 
 
+class SetupTest(unittest.TestCase):
+    OTHER = {"type": "command", "command": "/usr/local/bin/cc-status"}
+
+    def settings(self):
+        return {"model": "opus", "hooks": {
+            "Stop": [{"hooks": [self.OTHER]}],
+            # an old ccwatch entry at a stale path, sharing its entry with another hook
+            "PostToolUse": [{"hooks": [self.OTHER, {"type": "command", "command": '"/old/ccwatch-hook.sh"'}]}],
+        }}
+
+    def test_merge_is_idempotent_and_keeps_other_hooks(self):
+        once = ccwatch.merge_hooks(self.settings(), '"/new/ccwatch-hook.sh"')
+        self.assertEqual(ccwatch.merge_hooks(once, '"/new/ccwatch-hook.sh"'), once)
+        self.assertEqual(once["model"], "opus")
+        self.assertEqual(once["hooks"]["Stop"][0], {"hooks": [self.OTHER]})
+        self.assertEqual(once["hooks"]["PostToolUse"][0], {"hooks": [self.OTHER]})  # stale path removed
+        missing, paths = ccwatch.hook_status(once)
+        self.assertEqual((missing, paths), ([], ["/new/ccwatch-hook.sh"]))
+        self.assertEqual(once["hooks"]["PreToolUse"][-1]["matcher"], "AskUserQuestion|ExitPlanMode")
+
+    def test_strip_restores(self):
+        merged = ccwatch.merge_hooks({"hooks": {"Stop": [{"hooks": [self.OTHER]}]}}, "/x/ccwatch-hook.sh")
+        self.assertEqual(ccwatch.strip_hooks(merged), {"hooks": {"Stop": [{"hooks": [self.OTHER]}]}})
+        self.assertEqual(ccwatch.strip_hooks(ccwatch.merge_hooks({}, "/x/ccwatch-hook.sh")), {})
+
+    def test_hook_status_wants_matchers(self):
+        s = ccwatch.merge_hooks({}, "/x/ccwatch-hook.sh")
+        del s["hooks"]["PreToolUse"][0]["matcher"]  # would mark every tool call as "needs you"
+        self.assertEqual(ccwatch.hook_status(s)[0], ["PreToolUse"])
+
+    def test_statusline_script(self):
+        with tempfile.NamedTemporaryFile(suffix=".sh") as f:
+            self.assertEqual(ccwatch.statusline_script({"statusLine": {"command": f"sh {f.name}"}}), f.name)
+            self.assertEqual(ccwatch.statusline_script({"statusLine": {"command": f.name}}), f.name)
+            self.assertIsNone(ccwatch.statusline_script({"statusLine": {"command": f"echo hi | {f.name}"}}))
+        self.assertIsNone(ccwatch.statusline_script({}))
+
+
 @unittest.skipUnless(shutil.which("jq"), "jq not installed")
 class HookTest(unittest.TestCase):
     def run_hook(self, home, payload):
