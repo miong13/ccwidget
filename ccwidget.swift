@@ -1445,16 +1445,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         host.sizingOptions = []
         p.contentView = host
         assistantPanel = p
-        if !p.setFrameUsingName("assistant"), let screen = NSScreen.main {  // first run: bottom-right corner
-            let v = screen.visibleFrame
-            p.setFrameOrigin(NSPoint(x: v.maxX - p.frame.width - 24, y: v.minY + 24))
-        }
-        if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(p.frame) }), let screen = NSScreen.main {
-            let v = screen.visibleFrame  // quit mid-flight, or its display was unplugged
-            p.setFrameOrigin(NSPoint(x: v.maxX - p.frame.width - 24, y: v.minY + 24))
-        }
-        p.setFrameAutosaveName("assistant")
+        UserDefaults.standard.removeObject(forKey: "NSWindow Frame assistant")  // no longer remembered (1.2)
+        p.setFrameOrigin(assistantCorner(on: Self.activeScreen()))
         assistantWatch = feed.$snap.receive(on: RunLoop.main).sink { [weak self] in self?.updateAssistant($0) }
+        // follow you: when another app comes forward on a different display, move there
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self?.followActiveScreen() }  // let its window come up
+        }
+    }
+
+    /// The display you're working on: the one holding the frontmost app's front
+    /// window, else the one under the pointer, else the main one.
+    static func activeScreen() -> NSScreen? {
+        let screens = NSScreen.screens
+        if let app = NSWorkspace.shared.frontmostApplication, app != NSRunningApplication.current,
+           let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                    kCGNullWindowID) as? [[String: Any]],
+           let front = windows.first(where: {  // front to back, so the first is its front window
+               ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier
+                   && ($0[kCGWindowLayer as String] as? Int) == 0
+           }),
+           let dict = front[kCGWindowBounds as String] as? NSDictionary,
+           let cg = CGRect(dictionaryRepresentation: dict), let primary = screens.first {
+            // window bounds are top-left based on the primary display; screens are bottom-left based
+            let rect = NSRect(x: cg.minX, y: primary.frame.maxY - cg.maxY, width: cg.width, height: cg.height)
+            let overlap = { (s: NSScreen) -> CGFloat in
+                let i = s.frame.intersection(rect)
+                return i.isNull ? 0 : i.width * i.height
+            }
+            if let best = screens.max(by: { overlap($0) < overlap($1) }), overlap(best) > 0 { return best }
+        }
+        let mouse = NSEvent.mouseLocation
+        return screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) ?? NSScreen.main ?? screens.first
+    }
+
+    /// Bottom-right corner of a screen, clear of the Dock.
+    func assistantCorner(on screen: NSScreen?) -> NSPoint {
+        guard let v = (screen ?? NSScreen.main)?.visibleFrame else { return assistantPanel.frame.origin }
+        return NSPoint(x: v.maxX - assistantPanel.frame.width - 24, y: v.minY + 24)
+    }
+
+    /// While it's showing and not mid-flight, glide to the active display's corner if that changed.
+    func followActiveScreen() {
+        guard assistantVisible, flightHome == nil, let p = assistantPanel, p.isVisible,
+              let screen = Self.activeScreen(), screen != p.screen else { return }
+        let corner = assistantCorner(on: screen)
+        p.alphaValue = 0
+        p.setFrameOrigin(corner)
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.3; p.animator().alphaValue = 1 }
     }
 
     private var assistantSize = CGSize.zero
@@ -1481,8 +1520,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         setAssistant(visible: enabled && !pids.subtracting(dismissed).isEmpty, pause: waiting.isEmpty ? 1.2 : 0)
     }
 
-    /// Fades in where it was left. It leaves by flying up off the top of the screen,
-    /// after `pause` seconds of "All caught up" when the last session was just answered.
+    /// Fades in at the bottom-right corner of the active display. It leaves by flying up
+    /// off the top of the screen, after `pause` seconds of "All caught up" when the last
+    /// session was just answered.
     func setAssistant(visible: Bool, pause: Double = 0) {
         guard visible != assistantVisible else { return }
         assistantVisible = visible
@@ -1496,12 +1536,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         assistant.leaving = false
         assistant.shown = true
-        if let home = flightHome {  // a session needs you mid-flight: fly back down
+        let screen = Self.activeScreen()
+        let corner = assistantCorner(on: screen)
+        if flightHome != nil {  // a session needs you mid-flight: fly back down
             flightHome = nil
+            if let screen = screen, screen != p.screen {  // to another display: come down from its top
+                p.setFrameOrigin(NSPoint(x: corner.x, y: screen.frame.maxY + 40))
+            }
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.4
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                p.animator().setFrame(NSRect(origin: home, size: p.frame.size), display: true)
+                p.animator().setFrame(NSRect(origin: corner, size: p.frame.size), display: true)
                 p.animator().alphaValue = 1
             }) { [weak self] in  // the card may have changed size on the way down
                 guard let self = self else { return }
@@ -1509,6 +1554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         } else if !p.isVisible {
             p.alphaValue = 0
+            p.setFrameOrigin(corner)
             p.orderFrontRegardless()
             NSAnimationContext.runAnimationGroup { $0.duration = 0.3; p.animator().alphaValue = 1 }
         }  // else it was still showing "All caught up": just carry on
@@ -1517,7 +1563,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var flightHome: NSPoint?  // where the robot hovered before it flew off
 
     /// Full thrust and lift-off: slow at first, then faster, until it's past the top
-    /// of the screen. Then it's hidden and put back on its spot for next time.
+    /// of the screen. Then it's hidden; it reappears in the active display's corner.
     private func flyAway() {
         let p = assistantPanel!
         let home = p.frame.origin
@@ -1532,7 +1578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }) { [weak self] in
             guard let self = self, !self.assistantVisible else { return }  // called back meanwhile
             p.orderOut(nil)
-            p.setFrameOrigin(home)  // also re-saves the spot, which the flight overwrote
+            p.setFrameOrigin(home)
             p.alphaValue = 1
             self.flightHome = nil
             self.assistant.shown = false

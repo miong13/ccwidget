@@ -113,7 +113,7 @@ open ccwidget.app
   - **What the card shows:** each waiting session's title, what it's asking for, how long it has waited and its project. With more than four waiting, it lists four and adds *+N more*.
   - **Click a session** on the card to jump to the window it runs in, just like a session tile (see *Click a session* below).
   - **×** sends it flying off straight away, until a *different* session needs you. The ones you dismissed don't bring it back.
-  - **Move it** by dragging the robot or the card. The spot is remembered, and the card grows upward from there, so the robot stays where you put it. It starts in the bottom-right corner, floats above other windows on every Space, and never takes keyboard focus.
+  - **Where it appears:** always in the bottom-right corner of the display you're working on, clear of the Dock, with the card growing upward from there. That's the display holding the frontmost app's front window, or failing that the one under the pointer, then the main display. If you switch to an app on another display while it's showing, it moves to that display's corner. You can drag it out of the way for the moment, but it comes back to the corner next time. It floats above other windows on every Space and never takes keyboard focus.
   - **Show hovering assistant** (in either right-click menu, on by default) turns it off or on. The choice is remembered.
   - It works whether the floating panel is shown or hidden.
 - **Show floating widget** (in either right-click menu) hides or shows the floating panel; the menu bar icon stays either way. The choice is remembered, so if you prefer the menu bar alone, the panel stays hidden on the next launch.
@@ -397,7 +397,7 @@ Start with `python3 ccwatch.py --doctor` (or *Run Diagnostics…* in the widget'
 | Packaged app says "ccwatch.py not found inside or next to ccwidget.app" | The app was built with `build-widget.sh`, not `package.sh`, and then moved away from this folder. Use the app from `dist/`, or rebuild with `./package.sh`. |
 | Packaged app shows "couldn't start python3" | No Python 3 at `/opt/homebrew/bin`, `/usr/local/bin` or `/usr/bin`. Install it (Homebrew, python.org, or the Command Line Tools via `xcode-select --install`), then reopen the app. |
 | "ccwidget" Not Opened, "Apple could not verify…" on another Mac | The app is ad-hoc signed and was downloaded or received, so it's quarantined. Click **Done**, then System Settings → Privacy & Security → **Open Anyway**, or run `xattr -dr com.apple.quarantine /Applications/ccwidget.app`. See `Open Me First.txt` and *Signing* under Packaging. |
-| Widget or assistant is off-screen after unplugging a display | `defaults delete local.ccwatch.widget` then reopen it; the panel starts in the top-right corner, the assistant in the bottom-right. |
+| Floating panel is off-screen after unplugging a display | `defaults delete local.ccwatch.widget` then reopen it; the panel starts in the top-right corner. (The assistant always appears on a connected display.) |
 
 To test the hook by hand:
 
