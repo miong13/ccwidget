@@ -9,10 +9,14 @@
 // It also lives in the menu bar: click the icon for the same view in a popover,
 // right-click it for the options menu. While a session waits on you, a hovering
 // robot assistant holds up a card of those sessions; click one to jump to it.
+// Notifications say when a long turn finishes or a plan limit runs high, and
+// ⌃⌥⌘J / ⌃⌥⌘W jump to the waiting session / show or hide the floating panel.
 
 import AppKit
+import Carbon.HIToolbox
 import Combine
 import SwiftUI
+import UserNotifications
 
 // MARK: - Feed data (mirrors snapshot() in ccwatch.py)
 
@@ -22,10 +26,20 @@ struct Snapshot: Decodable {
     var limitsStale: String?
     var today: Today?
     var projects: Projects?
+    var setup: Setup?
+}
+
+/// Whether the hook ("needs you") and the status line capture (limits, ctx, cost) are set up.
+struct Setup: Decodable {
+    var hooks: Bool
+    var statusline: Bool
 }
 
 struct Sess: Decodable {
     var pid: Int?
+    var sid: String?
+    var cwd: String?
+    var transcript: String?
     var name: String
     var title: String?
     var project: String?
@@ -35,6 +49,7 @@ struct Sess: Decodable {
     var doing: String?
     var detail: String?
     var elapsed: String?
+    var stateSecs: Double?   // seconds in the current state (since the wait began, when waiting)
     var uptime: String?
     var ctx: Double?
     var cost: Double?
@@ -107,6 +122,8 @@ final class Feed: ObservableObject {
     private var proc: Process?
     private var buffer = Data()
     private var stopping = false
+    private var failures = 0     // restarts in a row without a good snapshot, for the backoff
+    private var lastError = ""   // last stderr line; shown only if the feed dies
     private let decoder: JSONDecoder = {
         let d = JSONDecoder()
         d.keyDecodingStrategy = .convertFromSnakeCase
@@ -141,6 +158,8 @@ final class Feed: ObservableObject {
             problem = "ccwatch.py not found inside or next to ccwidget.app"
             return
         }
+        buffer = Data()
+        lastError = ""
         let p = Process()
         p.executableURL = URL(fileURLWithPath: Feed.locatePython())
         p.arguments = ["-B", script, "--json"]
@@ -155,14 +174,19 @@ final class Feed: ObservableObject {
         err.fileHandleForReading.readabilityHandler = { [weak self] h in
             let d = h.availableData
             guard !d.isEmpty, let s = String(data: d, encoding: .utf8) else { return }
+            // a warning on stderr isn't a failure; keep it in case the feed dies
             let last = s.split(separator: "\n").last.map(String.init) ?? s
-            DispatchQueue.main.async { self?.problem = last }
+            DispatchQueue.main.async { self?.lastError = last }
         }
         p.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self = self, !self.stopping else { return }
-                self.problem = self.problem ?? "ccwatch stopped; restarting…"
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.start() }
+                // 3 s, 6 s, 12 s … up to a minute while it keeps failing
+                let delay = min(60, 3 * pow(2, Double(self.failures)))
+                self.failures += 1
+                self.problem = (self.lastError.isEmpty ? "ccwatch stopped" : self.lastError)
+                    + "; restarting in \(Int(delay))s…"
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { self.start() }
             }
         }
         do {
@@ -184,6 +208,21 @@ final class Feed: ObservableObject {
         try? p.run()
     }
 
+    /// Run ccwatch.py with these arguments (e.g. --doctor) and return everything it printed.
+    static func run(_ args: [String]) -> String {
+        guard let script = locateScript() else { return "ccwatch.py not found inside or next to ccwidget.app" }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: locatePython())
+        p.arguments = ["-B", script] + args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return "couldn't start python3: \(error.localizedDescription)" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     func stop() {
         stopping = true
         proc?.terminate()
@@ -201,6 +240,7 @@ final class Feed: ObservableObject {
             snap = try decoder.decode(Snapshot.self, from: line)
             updated = Date()
             problem = nil
+            failures = 0
         } catch {
             problem = "bad data from ccwatch: \(error)"
         }
@@ -465,6 +505,31 @@ struct SectionTitle: View {
     }
 }
 
+/// Context-window fill: a short bar and its percentage, green / yellow / red like the dashboard.
+struct CtxGauge: View {
+    let pct: Double
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ZStack(alignment: .leading) {
+                Capsule().fill(Palette.faint)
+                Capsule().fill(Palette.level(pct)).frame(width: max(2, 28 * CGFloat(min(pct, 100)) / 100))
+            }
+            .frame(width: 28, height: 4)
+            Text("\(Int(pct.rounded()))%")
+                .font(.system(size: 9.5, weight: pct >= 80 ? .bold : .regular))
+                .foregroundColor(pct >= 80 ? Palette.level(pct) : Palette.dim)
+                .monospacedDigit()
+        }
+        .help("Context window \(Int(pct.rounded()))% full" + (pct >= 80 ? " · time to /compact" : ""))
+    }
+}
+
+/// The session row under the pointer, for the right-click menu (see AppDelegate).
+enum HoverTarget {
+    static var session: Sess?
+}
+
 struct SessionRow: View {
     let s: Sess
     let frame: Int
@@ -490,6 +555,9 @@ struct SessionRow: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer(minLength: 4)
+                if let ctx = s.ctx, !compact || ctx >= 80 {  // compact: only as a warning
+                    CtxGauge(pct: ctx)
+                }
                 Text(s.elapsed ?? "")
                     .font(.system(size: 10))
                     .foregroundColor(stateColor)
@@ -540,15 +608,32 @@ struct SessionRow: View {
         )
         .contentShape(RoundedRectangle(cornerRadius: 8))
         .onHover { inside in  // click jumps to the session's window
+            if inside {
+                HoverTarget.session = s
+            } else if HoverTarget.session?.pid == s.pid {
+                HoverTarget.session = nil
+            }
             guard s.pid != nil, inside != hovering else { return }
             hovering = inside
             if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
         }
-        .onDisappear { if hovering { NSCursor.pop() } }
+        .onDisappear {
+            if hovering { NSCursor.pop() }
+            if HoverTarget.session?.pid == s.pid { HoverTarget.session = nil }
+        }
         .onTapGesture {
             if let pid = s.pid { Feed.focus(pid: pid) }
         }
-        .help(s.pid == nil ? "" : "Click to show this session's window")
+        .help(tooltip)
+    }
+
+    private var tooltip: String {
+        var facts = [s.model, s.uptime.map { "up \($0)" }].compactMap { $0?.isEmpty == false ? $0 : nil }
+        if let ctx = s.ctx { facts.append("ctx \(Int(ctx.rounded()))%") }
+        if let cost = s.cost { facts.append(String(format: "≈$%.2f", cost)) }
+        var lines = [facts.joined(separator: " · ")].filter { !$0.isEmpty }
+        if s.pid != nil { lines.append("Click to show this session's window · right-click for more") }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -682,16 +767,52 @@ struct ProjectsSection: View {
     }
 }
 
+/// Shown while the hook or the status line capture is missing, e.g. on a new Mac.
+struct SetupPrompt: View {
+    let setup: Setup
+
+    var body: some View {
+        let what = setup.hooks ? "Plan limits aren't set up"
+            : setup.statusline ? "“Needs you” alerts aren't set up"
+            : "“Needs you” alerts and limits aren't set up"
+        HStack(spacing: 6) {
+            Image(systemName: "wrench.and.screwdriver").foregroundColor(Palette.warn)
+            Text(what).foregroundColor(.primary.opacity(0.8)).lineLimit(1)
+            Spacer(minLength: 4)
+            Button {
+                NSApp.sendAction(#selector(AppDelegate.runSetup), to: NSApp.delegate, from: nil)
+            } label: {
+                Text("Set up…").font(.system(size: 10, weight: .semibold)).foregroundColor(Palette.accent)
+            }
+            .buttonStyle(.plain)
+            .help("Add the ccwatch hook and status line capture to ~/.claude (shows the changes first)")
+        }
+        .font(.system(size: 10))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Palette.warn.opacity(0.12)))
+    }
+}
+
 // MARK: - Widget
+
+/// Whether a host window is on screen; while it isn't, the widget stops animating.
+final class Visibility: ObservableObject {
+    @Published var visible: Bool
+    init(_ visible: Bool) { self.visible = visible }
+}
 
 struct WidgetView: View {
     @ObservedObject var feed: Feed
+    @ObservedObject var visibility: Visibility
     @AppStorage("compact") var compact = false
     var chrome = true  // false inside the menu bar popover, which brings its own frame
     var onSize: (CGSize) -> Void
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 0.1)) { tl in
+        // 10 fps while something is working or waiting, 2 fps when all is idle, none while hidden
+        let animating = feed.snap?.sessions.contains { $0.state == "busy" || $0.state == "wait" } ?? true
+        TimelineView(.animation(minimumInterval: animating ? 0.1 : 0.5, paused: !visibility.visible)) { tl in
             let frame = Int(tl.date.timeIntervalSinceReferenceDate * 10)
             content(frame: frame)
                 .frame(width: compact ? 300 : 370)
@@ -706,6 +827,9 @@ struct WidgetView: View {
         let snap = feed.snap
         VStack(alignment: .leading, spacing: 7) {
             Header(snap: snap, frame: frame, compact: $compact)
+            if let setup = snap?.setup, !(setup.hooks && setup.statusline) {
+                SetupPrompt(setup: setup)
+            }
             if let snap = snap {
                 let sessions = compact
                     ? Array(snap.sessions.filter { $0.state != "idle" }.prefix(4))
@@ -1034,6 +1158,161 @@ struct AssistantView: View {
     }
 }
 
+// MARK: - Notifications
+
+/// "45s", "5m12s", "1h05m"
+func fmtDuration(_ secs: Double) -> String {
+    let s = Int(max(0, secs))
+    if s < 60 { return "\(s)s" }
+    if s < 3600 { return String(format: "%dm%02ds", s / 60, s % 60) }
+    return String(format: "%dh%02dm", s / 3600, s % 3600 / 60)
+}
+
+/// macOS notifications from the snapshots: a long turn finished, a session needs
+/// you (off by default; the hovering assistant covers that), a plan limit
+/// crossed 80%, 95% or 100%. Clicking one about a session jumps to its window.
+final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+    enum Kind: String, CaseIterable {
+        case finished = "notifyFinished", waiting = "notifyWaiting", limits = "notifyLimits"
+
+        var title: String {
+            switch self {
+            case .finished: return "When a Long Turn Finishes"
+            case .waiting: return "When a Session Needs You"
+            case .limits: return "Plan Limit Warnings"
+            }
+        }
+
+        var enabled: Bool { UserDefaults.standard.object(forKey: rawValue) as? Bool ?? (self != .waiting) }
+    }
+
+    /// Seconds a turn must run before its end is worth a notification.
+    static var finishedAfter: Double { UserDefaults.standard.object(forKey: "notifyAfter") as? Double ?? 120 }
+    static let thresholds = [100, 95, 80]
+
+    private var watch: AnyCancellable?
+    private var last: [Int: (state: String, secs: Double)] = [:]  // by pid, from the previous snapshot
+    private var primed = false  // the first snapshot only sets the baseline
+
+    init(feed: Feed) {
+        super.init()
+        UNUserNotificationCenter.current().delegate = self
+        watch = feed.$snap.receive(on: RunLoop.main).sink { [weak self] in self?.update($0) }
+    }
+
+    private func update(_ snap: Snapshot?) {
+        guard let snap = snap else { return }
+        var now: [Int: (state: String, secs: Double)] = [:]
+        for s in snap.sessions {
+            guard let pid = s.pid else { continue }
+            now[pid] = (s.state, s.stateSecs ?? 0)
+            guard primed, let prev = last[pid] else { continue }
+            let title = s.title?.isEmpty == false ? s.title! : s.name
+            if prev.state == "busy", s.state == "idle", Kind.finished.enabled, prev.secs >= Self.finishedAfter {
+                post(id: "finished-\(pid)", title: "Finished: \(title)",
+                     body: "\(s.project ?? s.name) · worked \(fmtDuration(prev.secs))", pid: pid)
+            }
+            if prev.state != "wait", s.state == "wait", Kind.waiting.enabled {
+                post(id: "waiting-\(pid)", title: "Needs you: \(title)",
+                     body: [s.doing, s.detail].compactMap { $0?.isEmpty == false ? $0 : nil }.joined(separator: " · "),
+                     pid: pid)
+            }
+        }
+        last = now
+        primed = true
+        checkLimits(snap.limits)
+    }
+
+    /// Each threshold fires once per window; what has fired is kept across launches.
+    private func checkLimits(_ limits: [Limit]) {
+        let d = UserDefaults.standard
+        let nowEpoch = Date().timeIntervalSince1970
+        var fired = (d.dictionary(forKey: "limitAlerts") as? [String: Int] ?? [:])
+            .filter { (Double($0.key.split(separator: "@").last ?? "") ?? 0) * 3600 > nowEpoch - 3600 }  // drop past windows
+        for l in limits {
+            guard let key = l.key, let at = l.resetsAt,
+                  let hit = Self.thresholds.first(where: { l.used >= Double($0) }) else { continue }
+            let id = "\(key)@\(Int(at / 3600))"  // the hour of the reset, in case resets_at jitters
+            guard hit > fired[id] ?? 0 else { continue }
+            fired[id] = hit
+            guard Kind.limits.enabled else { continue }
+            let resets = AppDelegate.untilReset(l).map { "resets in \($0)" } ?? ""
+            post(id: "limit-\(id)", title: hit >= 100 ? "\(l.label.capitalized) limit reached" : "\(l.label.capitalized) limit \(Int(l.used))% used",
+                 body: [resets, l.pace ?? ""].filter { !$0.isEmpty }.joined(separator: " · "), pid: nil)
+        }
+        d.set(fired, forKey: "limitAlerts")
+    }
+
+    /// Asks for permission the first time; after that macOS remembers the answer.
+    private func post(id: String, title: String, body: String, pid: Int?) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        if let pid = pid { content.userInfo = ["pid": pid] }
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { ok, _ in
+            guard ok else { return }
+            center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+        }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
+        done([.banner, .sound])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler done: @escaping () -> Void) {
+        if let pid = response.notification.request.content.userInfo["pid"] as? Int {
+            DispatchQueue.main.async { Feed.focus(pid: pid) }
+        }
+        done()
+    }
+}
+
+// MARK: - Global shortcuts
+
+/// System-wide shortcuts through Carbon's RegisterEventHotKey, which needs no
+/// Accessibility permission. Each is ⌃⌥⌘ plus a key.
+final class HotKeys {
+    private var refs: [EventHotKeyRef] = []
+    private var handler: EventHandlerRef?
+    private var actions: [UInt32: () -> Void] = [:]
+
+    /// keys: (virtual key code, action)
+    func register(_ keys: [(Int, () -> Void)]) {
+        unregister()
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, me in
+            var id = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
+            let hotKeys = Unmanaged<HotKeys>.fromOpaque(me!).takeUnretainedValue()
+            DispatchQueue.main.async { hotKeys.actions[id.id]?() }
+            return noErr
+        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handler)
+        for (n, (code, action)) in keys.enumerated() {
+            var ref: EventHotKeyRef?
+            let id = EventHotKeyID(signature: OSType(0x6363_7767), id: UInt32(n + 1))  // 'ccwg'
+            // a key another app already holds just doesn't register
+            if RegisterEventHotKey(UInt32(code), UInt32(controlKey | optionKey | cmdKey), id,
+                                   GetApplicationEventTarget(), 0, &ref) == noErr, let ref = ref {
+                refs.append(ref)
+                actions[id.id] = action
+            }
+        }
+    }
+
+    func unregister() {
+        refs.forEach { UnregisterEventHotKey($0) }
+        refs = []
+        actions = [:]
+        if let h = handler { RemoveEventHandler(h) }
+        handler = nil
+    }
+}
+
 // MARK: - App
 
 
@@ -1044,6 +1323,8 @@ final class WidgetPanel: NSPanel {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let feed = Feed()
+    let panelVisibility = Visibility(false)
+    let popoverVisibility = Visibility(false)
     var panel: WidgetPanel!
     var statusItem: NSStatusItem!
     let popover = NSPopover()
@@ -1064,7 +1345,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         panel.hidesOnDeactivate = false
         panel.alphaValue = UserDefaults.standard.object(forKey: "opacity") as? Double ?? 1
 
-        let view = WidgetView(feed: feed, onSize: { [weak self] in self?.fit($0) })
+        let view = WidgetView(feed: feed, visibility: panelVisibility, onSize: { [weak self] in self?.fit($0) })
         let host = NSHostingView(rootView: view)
         host.sizingOptions = []
         panel.contentView = host
@@ -1078,7 +1359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                   window === self.panel || window === self.assistantPanel
                     || window === self.popover.contentViewController?.view.window,
                   event.type == .rightMouseDown || event.modifierFlags.contains(.control) else { return event }
-            NSMenu.popUpContextMenu(self.buildMenu(), with: event, for: view)
+            NSMenu.popUpContextMenu(self.buildMenu(session: HoverTarget.session), with: event, for: view)
             return nil
         }
 
@@ -1090,9 +1371,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if UserDefaults.standard.object(forKey: "floating") as? Bool ?? true {
             panel.orderFrontRegardless()
         }
+        // covered by a full-screen app, on another display that's asleep, or hidden from the menu
+        NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification,
+                                               object: panel, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.panelVisibility.visible = self.panel.occlusionState.contains(.visible)
+        }
+        panelVisibility.visible = panel.isVisible
         setUpStatusItem()
         setUpAssistant()
         feed.start()
+        notifier = Notifier(feed: feed)
+        updateHotKeys()
+    }
+
+    // MARK: Notifications and shortcuts
+
+    var notifier: Notifier?
+    let hotKeys = HotKeys()
+
+    var hotKeysOn: Bool { UserDefaults.standard.object(forKey: "hotkeys") as? Bool ?? true }
+
+    func updateHotKeys() {
+        guard hotKeysOn else { return hotKeys.unregister() }
+        hotKeys.register([(kVK_ANSI_J, { [weak self] in self?.jumpToWaiting() }),
+                          (kVK_ANSI_W, { [weak self] in self?.toggleFloating() })])
+    }
+
+    /// ⌃⌥⌘J: the session that has waited longest, or the popover when none is waiting.
+    func jumpToWaiting() {
+        let waiting = (feed.snap?.sessions ?? []).filter { $0.state == "wait" && $0.pid != nil }
+        if let s = waiting.max(by: { ($0.stateSecs ?? 0) < ($1.stateSecs ?? 0) }), let pid = s.pid {
+            Feed.focus(pid: pid)
+        } else if let button = statusItem.button, !popover.isShown {
+            NSApp.activate(ignoringOtherApps: true)
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+    }
+
+    @objc func toggleHotKeys() {
+        UserDefaults.standard.set(!hotKeysOn, forKey: "hotkeys")
+        updateHotKeys()
+    }
+
+    @objc func toggleNotification(_ sender: NSMenuItem) {
+        guard let kind = (sender.representedObject as? String).flatMap(Notifier.Kind.init(rawValue:)) else { return }
+        UserDefaults.standard.set(!kind.enabled, forKey: kind.rawValue)
     }
 
     // MARK: Hovering assistant
@@ -1121,16 +1445,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         host.sizingOptions = []
         p.contentView = host
         assistantPanel = p
-        if !p.setFrameUsingName("assistant"), let screen = NSScreen.main {  // first run: bottom-right corner
-            let v = screen.visibleFrame
-            p.setFrameOrigin(NSPoint(x: v.maxX - p.frame.width - 24, y: v.minY + 24))
-        }
-        if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(p.frame) }), let screen = NSScreen.main {
-            let v = screen.visibleFrame  // quit mid-flight, or its display was unplugged
-            p.setFrameOrigin(NSPoint(x: v.maxX - p.frame.width - 24, y: v.minY + 24))
-        }
-        p.setFrameAutosaveName("assistant")
+        UserDefaults.standard.removeObject(forKey: "NSWindow Frame assistant")  // no longer remembered (1.2)
+        p.setFrameOrigin(assistantCorner(on: Self.activeScreen()))
         assistantWatch = feed.$snap.receive(on: RunLoop.main).sink { [weak self] in self?.updateAssistant($0) }
+        // follow you: when another app comes forward on a different display, move there
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self?.followActiveScreen() }  // let its window come up
+        }
+    }
+
+    /// The display you're working on: the one holding the frontmost app's front
+    /// window, else the one under the pointer, else the main one.
+    static func activeScreen() -> NSScreen? {
+        let screens = NSScreen.screens
+        if let app = NSWorkspace.shared.frontmostApplication, app != NSRunningApplication.current,
+           let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                    kCGNullWindowID) as? [[String: Any]],
+           let front = windows.first(where: {  // front to back, so the first is its front window
+               ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier
+                   && ($0[kCGWindowLayer as String] as? Int) == 0
+           }),
+           let dict = front[kCGWindowBounds as String] as? NSDictionary,
+           let cg = CGRect(dictionaryRepresentation: dict), let primary = screens.first {
+            // window bounds are top-left based on the primary display; screens are bottom-left based
+            let rect = NSRect(x: cg.minX, y: primary.frame.maxY - cg.maxY, width: cg.width, height: cg.height)
+            let overlap = { (s: NSScreen) -> CGFloat in
+                let i = s.frame.intersection(rect)
+                return i.isNull ? 0 : i.width * i.height
+            }
+            if let best = screens.max(by: { overlap($0) < overlap($1) }), overlap(best) > 0 { return best }
+        }
+        let mouse = NSEvent.mouseLocation
+        return screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) ?? NSScreen.main ?? screens.first
+    }
+
+    /// Bottom-right corner of a screen, clear of the Dock.
+    func assistantCorner(on screen: NSScreen?) -> NSPoint {
+        guard let v = (screen ?? NSScreen.main)?.visibleFrame else { return assistantPanel.frame.origin }
+        return NSPoint(x: v.maxX - assistantPanel.frame.width - 24, y: v.minY + 24)
+    }
+
+    /// While it's showing and not mid-flight, glide to the active display's corner if that changed.
+    func followActiveScreen() {
+        guard assistantVisible, flightHome == nil, let p = assistantPanel, p.isVisible,
+              let screen = Self.activeScreen(), screen != p.screen else { return }
+        let corner = assistantCorner(on: screen)
+        p.alphaValue = 0
+        p.setFrameOrigin(corner)
+        NSAnimationContext.runAnimationGroup { $0.duration = 0.3; p.animator().alphaValue = 1 }
     }
 
     private var assistantSize = CGSize.zero
@@ -1157,8 +1520,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         setAssistant(visible: enabled && !pids.subtracting(dismissed).isEmpty, pause: waiting.isEmpty ? 1.2 : 0)
     }
 
-    /// Fades in where it was left. It leaves by flying up off the top of the screen,
-    /// after `pause` seconds of "All caught up" when the last session was just answered.
+    /// Fades in at the bottom-right corner of the active display. It leaves by flying up
+    /// off the top of the screen, after `pause` seconds of "All caught up" when the last
+    /// session was just answered.
     func setAssistant(visible: Bool, pause: Double = 0) {
         guard visible != assistantVisible else { return }
         assistantVisible = visible
@@ -1172,12 +1536,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         assistant.leaving = false
         assistant.shown = true
-        if let home = flightHome {  // a session needs you mid-flight: fly back down
+        let screen = Self.activeScreen()
+        let corner = assistantCorner(on: screen)
+        if flightHome != nil {  // a session needs you mid-flight: fly back down
             flightHome = nil
+            if let screen = screen, screen != p.screen {  // to another display: come down from its top
+                p.setFrameOrigin(NSPoint(x: corner.x, y: screen.frame.maxY + 40))
+            }
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.4
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                p.animator().setFrame(NSRect(origin: home, size: p.frame.size), display: true)
+                p.animator().setFrame(NSRect(origin: corner, size: p.frame.size), display: true)
                 p.animator().alphaValue = 1
             }) { [weak self] in  // the card may have changed size on the way down
                 guard let self = self else { return }
@@ -1185,6 +1554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         } else if !p.isVisible {
             p.alphaValue = 0
+            p.setFrameOrigin(corner)
             p.orderFrontRegardless()
             NSAnimationContext.runAnimationGroup { $0.duration = 0.3; p.animator().alphaValue = 1 }
         }  // else it was still showing "All caught up": just carry on
@@ -1193,7 +1563,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var flightHome: NSPoint?  // where the robot hovered before it flew off
 
     /// Full thrust and lift-off: slow at first, then faster, until it's past the top
-    /// of the screen. Then it's hidden and put back on its spot for next time.
+    /// of the screen. Then it's hidden; it reappears in the active display's corner.
     private func flyAway() {
         let p = assistantPanel!
         let home = p.frame.origin
@@ -1208,7 +1578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }) { [weak self] in
             guard let self = self, !self.assistantVisible else { return }  // called back meanwhile
             p.orderOut(nil)
-            p.setFrameOrigin(home)  // also re-saves the spot, which the flight overwrote
+            p.setFrameOrigin(home)
             p.alphaValue = 1
             self.flightHome = nil
             self.assistant.shown = false
@@ -1226,7 +1596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // MARK: Menu bar icon
 
     func setUpStatusItem() {
-        let content = NSHostingController(rootView: WidgetView(feed: feed, chrome: false, onSize: { [weak self] size in
+        let content = NSHostingController(rootView: WidgetView(feed: feed, visibility: popoverVisibility, chrome: false, onSize: { [weak self] size in
             guard let self = self, size.width > 0, size.height > 0, self.popover.contentSize != size else { return }
             self.popover.contentSize = size
         }))
@@ -1472,8 +1842,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     static let opacities = [100, 90, 80, 70, 60, 50]
 
     /// Built fresh on each right-click so the checkmarks match the current settings.
-    func buildMenu() -> NSMenu {
+    /// Right-clicking a session row puts that session's actions at the top.
+    func buildMenu(session: Sess? = nil) -> NSMenu {
         let menu = NSMenu()
+        if let s = session, s.pid != nil {
+            let header = NSMenuItem(title: s.title?.isEmpty == false ? s.title! : s.name, action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            let actions: [(String, Selector, Bool)] = [
+                ("Jump to Window", #selector(jumpToSession(_:)), true),
+                ("Copy Resume Command", #selector(copyResumeCommand(_:)), s.sid != nil && s.cwd != nil),
+                ("Reveal Project in Finder", #selector(revealProject(_:)), s.cwd != nil),
+                ("Reveal Transcript in Finder", #selector(revealTranscript(_:)), s.transcript != nil),
+            ]
+            for (title, action, enabled) in actions where enabled {
+                let i = item(title, action)
+                i.representedObject = s
+                menu.addItem(i)
+            }
+            menu.addItem(.separator())
+        }
         menu.addItem(item("About ccwidget", #selector(showAbout)))
         menu.addItem(.separator())
         let compact = UserDefaults.standard.bool(forKey: "compact")
@@ -1495,7 +1883,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let helper = item("Show hovering assistant", #selector(toggleAssistant))
         helper.state = UserDefaults.standard.object(forKey: "assistant") as? Bool ?? true ? .on : .off
         menu.addItem(helper)
+        let notifications = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
+        let nsub = NSMenu()
+        for kind in Notifier.Kind.allCases {
+            let i = item(kind == .finished ? "\(kind.title) (\(fmtDuration(Notifier.finishedAfter))+)" : kind.title,
+                         #selector(toggleNotification(_:)))
+            i.representedObject = kind.rawValue
+            i.state = kind.enabled ? .on : .off
+            nsub.addItem(i)
+        }
+        notifications.submenu = nsub
+        menu.addItem(notifications)
+        let keys = item("Global Shortcuts: ⌃⌥⌘J Jump · ⌃⌥⌘W Panel", #selector(toggleHotKeys))
+        keys.state = hotKeysOn ? .on : .off
+        menu.addItem(keys)
         menu.addItem(item("Open full dashboard", #selector(openDashboard)))
+        menu.addItem(item("Set Up Hooks & Status Line…", #selector(runSetup)))
+        menu.addItem(item("Run Diagnostics…", #selector(runDoctor)))
         menu.addItem(.separator())
         menu.addItem(item("Quit ccwidget", #selector(quit)))
         return menu
@@ -1507,14 +1911,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return i
     }
 
+    @objc func jumpToSession(_ sender: NSMenuItem) {
+        if let pid = (sender.representedObject as? Sess)?.pid { Feed.focus(pid: pid) }
+    }
+
+    /// `cd '<project>' && claude --resume <session id>`, ready to paste into a terminal.
+    @objc func copyResumeCommand(_ sender: NSMenuItem) {
+        guard let s = sender.representedObject as? Sess, let sid = s.sid, let cwd = s.cwd else { return }
+        let quoted = "'" + cwd.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString("cd \(quoted) && claude --resume \(sid)", forType: .string)
+    }
+
+    @objc func revealProject(_ sender: NSMenuItem) {
+        guard let cwd = (sender.representedObject as? Sess)?.cwd else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: cwd)])
+    }
+
+    @objc func revealTranscript(_ sender: NSMenuItem) {
+        guard let path = (sender.representedObject as? Sess)?.transcript else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    /// Shows what `ccwatch.py --install` would change, then does it once confirmed.
+    @objc func runSetup() {
+        popover.performClose(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        let preview = Feed.run(["--install", "--dry-run"])
+        guard preview.split(separator: "\n").contains(where: { $0.hasPrefix("+ ") }) else {
+            showText("Already set up", preview)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Set up the hook and status line?"
+        alert.informativeText = "These changes are made in ~/.claude, keeping a backup of each file edited:"
+        alert.accessoryView = Self.monospaced(preview.replacingOccurrences(of: "\n(dry run: nothing written)", with: ""))
+        alert.addButton(withTitle: "Set Up")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        showText("Setup", Feed.run(["--install"]))
+    }
+
+    @objc func runDoctor() {
+        popover.performClose(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        showText("ccwatch diagnostics", Feed.run(["--doctor"]))
+    }
+
+    private func showText(_ title: String, _ text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.accessoryView = Self.monospaced(text)
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    /// Command output for an alert, in a monospaced wrapping label.
+    static func monospaced(_ text: String) -> NSView {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        label.isSelectable = true
+        label.preferredMaxLayoutWidth = 480
+        label.frame = NSRect(origin: .zero, size: NSSize(width: 480, height: label.fittingSize.height))
+        return label
+    }
+
     @objc func setOpacity(_ sender: NSMenuItem) {
         let a = Double(sender.tag) / 100
         panel.alphaValue = a
         UserDefaults.standard.set(a, forKey: "opacity")
     }
 
+    func popoverWillShow(_ note: Notification) {
+        popoverVisibility.visible = true
+    }
+
     func popoverWillClose(_ note: Notification) {
         popoverClosed = Date()
+    }
+
+    func popoverDidClose(_ note: Notification) {
+        popoverVisibility.visible = false
     }
 
     var aboutWindow: NSWindow?
