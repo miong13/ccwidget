@@ -34,6 +34,12 @@ case "$ev" in
       elicitation_dialog) [ -f "$f" ] || mark_waiting input "$msg" ;;
     esac
     ;;
-  *) rm -f "$f" ;; # PostToolUse, PostToolUseFailure, PermissionDenied, ElicitationResult, UserPromptSubmit, Stop, StopFailure, SessionEnd
+  PostToolUse | PostToolUseFailure)
+    # only the call that was waiting: parallel tool calls and subagents finish
+    # while a prompt is still open
+    [ -f "$f" ] && jq -e --arg tool "$tool" --arg d "$detail" '.tool == $tool and .detail == $d' "$f" >/dev/null 2>&1 &&
+      rm -f "$f"
+    ;;
+  *) rm -f "$f" ;; # PermissionDenied, ElicitationResult, UserPromptSubmit, Stop, StopFailure, SessionEnd
 esac
 exit 0
