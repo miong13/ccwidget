@@ -248,6 +248,42 @@ class SetupTest(unittest.TestCase):
         self.assertIsNone(ccwatch.statusline_script({}))
 
 
+class WaitTest(unittest.TestCase):
+    """Session._load_wait: the registry's "waiting" status decides; the hook adds details."""
+
+    def wait(self, info, record):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        if record:
+            with open(os.path.join(d, "abc.json"), "w") as f:
+                json.dump(record, f)
+        s = ccwatch.Session.__new__(ccwatch.Session)
+        s.sid, s.info = "abc", info
+        with mock.patch.object(ccwatch, "STATE_DIR", d):
+            return s._load_wait()
+
+    REC = {"state": "waiting", "reason": "permission", "tool": "Bash", "detail": "rm -rf build", "since": 1000}
+
+    def test_registry_waiting_keeps_hook_details(self):
+        self.assertEqual(self.wait({"status": "waiting", "statusUpdatedAt": 1000_500}, self.REC)["detail"], "rm -rf build")
+
+    def test_registry_waiting_without_record(self):
+        w = self.wait({"status": "waiting", "statusUpdatedAt": 2000_000, "waitingFor": "dialog open"}, None)
+        self.assertEqual((w["reason"], w["detail"], w["since"]), ("dialog", "dialog open", 2000))
+        # a record left from an earlier prompt doesn't describe this one
+        self.assertEqual(self.wait({"status": "waiting", "statusUpdatedAt": 2000_000, "waitingFor": "input needed"},
+                                   self.REC)["reason"], "input")
+
+    def test_answered(self):
+        self.assertIsNone(self.wait({"status": "busy", "statusUpdatedAt": 1010_000}, self.REC))
+        self.assertIsNone(self.wait({"status": "idle", "statusUpdatedAt": 1010_000}, self.REC))
+        self.assertIsNone(self.wait({"status": "busy", "statusUpdatedAt": 1010_000}, None))
+
+    def test_registry_without_waiting_status(self):
+        # older Claude Code: still "busy" from before the prompt, so the hook's flag stands
+        self.assertEqual(self.wait({"status": "busy", "statusUpdatedAt": 900_000}, self.REC), self.REC)
+
+
 @unittest.skipUnless(shutil.which("jq"), "jq not installed")
 class HookTest(unittest.TestCase):
     def run_hook(self, home, payload):
@@ -263,7 +299,16 @@ class HookTest(unittest.TestCase):
         with open(state) as f:
             w = json.load(f)
         self.assertEqual((w["state"], w["reason"], w["tool"], w["detail"]), ("waiting", "permission", "Bash", "rm -rf build"))
-        self.run_hook(home, {"session_id": "abc", "hook_event_name": "PostToolUse"})
+        # a parallel call finishing while the prompt is still open leaves it alone
+        self.run_hook(home, {"session_id": "abc", "hook_event_name": "PostToolUse", "tool_name": "Bash",
+                             "tool_input": {"command": "ls"}})
+        self.assertTrue(os.path.exists(state))
+        self.run_hook(home, {"session_id": "abc", "hook_event_name": "PostToolUse", "tool_name": "Bash",
+                             "tool_input": {"command": "rm -rf build\nmore"}})
+        self.assertFalse(os.path.exists(state))
+        self.run_hook(home, {"session_id": "abc", "hook_event_name": "PermissionRequest", "tool_name": "Bash",
+                             "tool_input": {"command": "x"}})
+        self.run_hook(home, {"session_id": "abc", "hook_event_name": "Stop"})
         self.assertFalse(os.path.exists(state))
 
 

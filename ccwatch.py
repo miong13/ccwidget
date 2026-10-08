@@ -221,21 +221,28 @@ class Session:
                 self.subs[p] = sa
 
     def _load_wait(self):
-        """The hook's waiting flag, unless the session has visibly moved on since.
+        """Whether the session is blocked on you, with the hook's record for details.
 
-        No hook fires when you deny a prompt, so a flag can outlive the wait;
-        new transcript output or the session going idle afterwards clears it.
+        Claude Code marks the session "waiting" in its registry for as long as a
+        prompt or dialog is open, so that decides. The hook's flag alone can't:
+        parallel tool calls, subagents and background tasks keep writing to the
+        transcript and firing PostToolUse while a prompt is still open. Older
+        Claude Code versions don't report "waiting"; for them the flag stands
+        until the session's status changes after it (answered, denied, interrupted).
         """
         w = load_json(os.path.join(STATE_DIR, f"{self.sid}.json"))
         if not w or w.get("state") != "waiting":
-            return None
-        since = w.get("since") or 0
-        try:
-            if self.transcript and os.path.getmtime(self.transcript) > since + 2:
-                return None
-        except OSError:
-            pass
-        if self.info.get("status") == "idle" and (self.info.get("statusUpdatedAt") or 0) / 1000 > since + 2:
+            w = None
+        updated = (self.info.get("statusUpdatedAt") or 0) / 1000
+        if self.info.get("status") == "waiting":
+            if w and (w.get("since") or 0) >= updated - 5:
+                return w
+            # no hook record for this prompt (a dialog, or the hook isn't installed)
+            why = self.info.get("waitingFor") or ""
+            reason = {"permission prompt": "permission", "sandbox request": "permission",
+                      "input needed": "input", "goal proposal": "question"}.get(why, "dialog")
+            return {"state": "waiting", "reason": reason, "tool": "", "detail": why, "since": int(updated or time.time())}
+        if w and updated > (w.get("since") or 0) + 2:
             return None
         return w
 
