@@ -69,7 +69,7 @@ Requirements: macOS (tested; Linux should work but hasn't been tried), Python 3.
 | `build-widget.sh` | Compiles `ccwidget.swift` into `ccwidget.app` in this folder (dev build; runs the `ccwatch.py` beside it). |
 | `package.sh` | Builds a self-contained, universal `dist/ccwidget.app` with `ccwatch.py` inside, plus a `.zip` and a `.dmg`. |
 | `dist/` | Output of `package.sh` (git-ignored, like `ccwidget.app`). |
-| `VERSION` | The project version (`1.2.0`). Shown in *About ccwidget* and used by `package.sh` as the default version. |
+| `VERSION` | The project version (`1.2.1`). Shown in *About ccwidget* and used by `package.sh` as the default version. |
 | `avatar.png` | The author's picture for *About ccwidget*, copied into the app at build time. |
 | `author.conf` | Author name and email for *About ccwidget*. |
 | `LICENSE` | MIT license. |
