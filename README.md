@@ -1,6 +1,6 @@
 # ccwidget - The Claude Code Monitoring Widget
 
-An animated terminal dashboard of every Claude Code session running on this machine: what each one is doing, which ones are waiting on you, their sub-agents, your plan usage, and the projects you've worked on today. It also comes as **ccwidget**, a macOS menu bar app and floating widget.
+An animated terminal dashboard of every Claude Code session running on this machine: what each one is doing, which ones are waiting on you, their sub-agents, your plan usage, and the projects you've worked on today. It also comes as **ccwidget**, a macOS menu bar app and floating widget. If you use [OpenCode](https://opencode.ai) too, it can show those sessions alongside (see [OpenCode](#opencode)); that's off until you turn it on.
 
 Source: [github.com/miong13/ccwidget](https://github.com/miong13/ccwidget). The ready-built app (`.dmg` / `.zip`) is on the [Releases](https://github.com/miong13/ccwidget/releases) page. It isn't notarized, so read `Open Me First.txt` inside the download before opening it (see [Packaging](#packaging)).
 
@@ -43,6 +43,7 @@ python3 ccwatch.py --json   # one JSON snapshot per second (feeds the desktop wi
 python3 ccwatch.py --focus <pid>   # bring the terminal/editor window running that claude process to the front
 python3 ccwatch.py --install       # add the hook and status line capture to ~/.claude (--dry-run to preview)
 python3 ccwatch.py --doctor        # check every data source and say what's missing
+python3 ccwatch.py --opencode      # any of the above, with OpenCode sessions too (or press o in the dashboard)
 ./build-widget.sh && open ccwidget.app   # floating desktop widget (see below)
 ./package.sh                             # self-contained ccwidget.app + .zip + .dmg in dist/ (see Packaging)
 ```
@@ -58,6 +59,7 @@ Requirements: macOS (tested; Linux should work but hasn't been tried), Python 3.
 | `q` / `Esc` | Quit |
 | `i` | Hide / show idle sessions |
 | `u` | Switch the usage and projects panels between full and compact |
+| `o` | Show / hide OpenCode sessions and usage (only offered when OpenCode is installed) |
 
 ## Files
 
@@ -65,11 +67,12 @@ Requirements: macOS (tested; Linux should work but hasn't been tried), Python 3.
 |---|---|
 | `ccwatch.py` | The dashboard. Reads local files only; the only things it deletes are stale files in its own `~/.cache/ccwatch`. `--install` / `--uninstall` are the only modes that edit anything else. |
 | `ccwatch-hook.sh` | Hook script that records when a session is blocked waiting on you. |
+| `ccwatch-opencode.js` | The same for OpenCode: a plugin that records when an OpenCode session works, goes idle or waits on you. `--install --opencode` copies it to `~/.config/opencode/plugins/ccwatch.js`. |
 | `ccwidget.swift` | Source of the floating desktop widget. |
 | `build-widget.sh` | Compiles `ccwidget.swift` into `ccwidget.app` in this folder (dev build; runs the `ccwatch.py` beside it). |
 | `package.sh` | Builds a self-contained, universal `dist/ccwidget.app` with `ccwatch.py` inside, plus a `.zip` and a `.dmg`. |
 | `dist/` | Output of `package.sh` (git-ignored, like `ccwidget.app`). |
-| `VERSION` | The project version (`1.2.1`). Shown in *About ccwidget* and used by `package.sh` as the default version. |
+| `VERSION` | The project version (`1.3.0`). Shown in *About ccwidget* and used by `package.sh` as the default version. |
 | `avatar.png` | The author's picture for *About ccwidget*, copied into the app at build time. |
 | `author.conf` | Author name and email for *About ccwidget*. |
 | `LICENSE` | MIT license. |
@@ -116,6 +119,7 @@ open ccwidget.app
   - **Where it appears:** always in the bottom-right corner of the display you're working on, clear of the Dock, with the card growing upward from there. That's the display holding the frontmost app's front window, or failing that the one under the pointer, then the main display. If you switch to an app on another display while it's showing, it moves to that display's corner. You can drag it out of the way for the moment, but it comes back to the corner next time. It floats above other windows on every Space and never takes keyboard focus.
   - **Show hovering assistant** (in either right-click menu, on by default) turns it off or on. The choice is remembered.
   - It works whether the floating panel is shown or hidden.
+- **Monitor OpenCode** (in either right-click menu, only when OpenCode is installed, off by default) adds OpenCode sessions and usage; see [OpenCode](#opencode). The choice is remembered.
 - **Show floating widget** (in either right-click menu) hides or shows the floating panel; the menu bar icon stays either way. The choice is remembered, so if you prefer the menu bar alone, the panel stays hidden on the next launch.
 - **Move** it by dragging anywhere on it; the position is remembered. It grows and shrinks to fit, keeping its top edge in place.
 - **Appearance** follows macOS Light/Dark mode: a solid near-white or near-black card, switching live when the system does.
@@ -131,7 +135,7 @@ open ccwidget.app
 - **Global shortcuts** (on by default; toggle with *Global Shortcuts* in the menu): **⌃⌥⌘J** jumps to the session that has waited longest, or opens the popover when none is waiting; **⌃⌥⌘W** shows or hides the floating panel. They need no Accessibility permission. If another app already uses one, that one just doesn't register.
 - **Set-up prompt:** when the hook or the status line capture is missing (say, on a new Mac), a yellow row at the top says what's missing, with a *Set up…* button. It shows what will change in `~/.claude` and asks before doing it. The same is in the menu as *Set Up Hooks & Status Line…*, next to *Run Diagnostics…* (`ccwatch.py --doctor`).
 - **Chevron** (top right) switches between full and compact. Compact shows only sessions that are working or need you, the two limit bars, and the top three projects.
-- **Right-click** for *About ccwidget*, compact/expand, the floating panel's opacity, *Show floating widget*, *Show hovering assistant*, *Notifications*, *Global Shortcuts*, *Open full dashboard* (opens `ccwatch.py` in a new iTerm window, or Terminal if iTerm isn't installed; macOS asks once for permission), *Set Up Hooks & Status Line…*, *Run Diagnostics…* and *Quit ccwidget*.
+- **Right-click** for *About ccwidget*, compact/expand, the floating panel's opacity, *Show floating widget*, *Show hovering assistant*, *Monitor OpenCode* (when installed), *Notifications*, *Global Shortcuts*, *Open full dashboard* (opens `ccwatch.py` in a new iTerm window, or Terminal if iTerm isn't installed; macOS asks once for permission), *Set Up Hooks & Status Line…*, *Run Diagnostics…* and *Quit ccwidget*.
 - **About ccwidget** (top of either right-click menu) opens a small window with:
   - the author's avatar, name and email (click the email to write one);
   - the version, plus a *dev build* tag when the app runs the `ccwatch.py` beside it instead of a bundled copy.
@@ -154,9 +158,9 @@ open ccwidget.app
   ```sh
   dscl . -read /Users/$USER JPEGPhoto | tail -n +2 | xxd -r -p > /tmp/me.jpg && sips -s format png -Z 256 /tmp/me.jpg --out avatar.png
   ```
-- **Click a session** to jump to the window it runs in. The pointer turns into a hand over a session tile. ccwatch finds the app hosting the `claude` process from its parent processes, then:
-  - **iTerm2 / Terminal:** the exact window and tab, matched by the session's tty.
-  - **Cursor / VS Code / Windsurf / VSCodium:** the project window open on the session's folder, from the editor's saved window list. It can't pick the terminal panel inside that window.
+- **Click a session** to jump to the window it runs in (an OpenCode session: the `opencode` terminal open on its folder, if any). The pointer turns into a hand over a session tile. ccwatch finds the app hosting the `claude` process from its parent processes, then:
+  - **iTerm2 / Terminal:** the exact window and tab, matched by the session's tty. iTerm2 3.5 and later start shells under its `iTermServer` helper rather than the app itself; that counts as iTerm2.
+  - **Cursor / VS Code / Windsurf / VSCodium:** the project window open on the session's folder, from the editor's saved window state. While the editor runs, that only names the window you used last, so with several windows open the click may just bring the editor forward. It can't pick the terminal panel inside that window.
   - **Android Studio and other JetBrains IDEs:** the project window, found by its title through System Events.
   - **Anything else:** the app comes forward.
 
@@ -238,9 +242,34 @@ python3 ccwatch.py --uninstall           # undo it (also takes --dry-run)
 2. **Status line capture.** If your status line runs a script file with an `input=$(cat)` line, the capture block (marked `# ccwatch:`) goes right after it. With no status line at all, it creates `~/.claude/ccwatch-statusline.sh` (the model and context %, plus the capture) and uses that. An inline status line command can't be edited safely, so it prints the block for you to add.
 3. **Backups** before the first edit of each file: `settings.json.bak-ccwatch` and `<status line script>.bak`. An existing backup is never overwritten, so it stays the copy from before ccwatch.
 
+With `--opencode` it also adds the OpenCode plugin, `~/.config/opencode/plugins/ccwatch.js` (see [OpenCode](#opencode)). A file of that name that isn't ccwatch's is left alone.
+
 It warns if `jq` is missing, since the hook and status line need it. Running sessions may need a restart to pick up the hooks.
 
-`--doctor` checks Python, `jq`, the session registry, transcripts, every hook entry and its script, the status line, how fresh the newest capture is, and leftover "needs you" flags. It prints ✓ / ✗ / ! with a hint for each problem, and exits non-zero when something is broken.
+`--doctor` checks Python, `jq`, the session registry, transcripts, every hook entry and its script, the status line, how fresh the newest capture is, and leftover "needs you" flags; with `--opencode`, also OpenCode's database, its model list and whether the plugin is installed and reporting. It prints ✓ / ✗ / ! with a hint for each problem, and exits non-zero when something is broken.
+
+## OpenCode
+
+ccwatch can also show [OpenCode](https://opencode.ai) sessions, next to the Claude ones. It's off by default:
+
+- **Widget:** right-click the menu bar icon or the panel and tick **Monitor OpenCode**. The item only appears when OpenCode is installed (its database at `~/.local/share/opencode/opencode.db`, or the `opencode` command in a usual place). The first time, it offers to install the plugin (below), showing the change and asking first.
+- **Terminal:** `python3 ccwatch.py --opencode`, or press `o` in the dashboard.
+
+What you get:
+
+| Where | OpenCode shows |
+|---|---|
+| **Session cards / rows** | Each open OpenCode session, tagged **OpenCode** in purple: title, project, current tool or text, model, context gauge (from OpenCode's model list; `?` for models it doesn't size, such as local Ollama ones), cost and lines changed, and its sub-agents (child sessions). |
+| **Needs you** | A permission prompt or a question in the session or one of its sub-agents, with what it asks for. It shows in the hovering assistant and notifications like a Claude one. Needs the plugin. |
+| **Finished, unseen** | OpenCode 2.0.30+ records when each turn ends and when an OpenCode window last showed it. A turn that ended while no window showed it gets a badge: green **✓ done · unseen**, red **✗ failed**, or yellow **■ interrupted**. It sorts right after working sessions, stays visible in compact mode and with idle sessions hidden, and clears as soon as you open the session in OpenCode. A failed turn also sends the *When a Long Turn Finishes* notification, however short it was. No plugin needed. |
+| **Usage** | An `OpenCode` row: today's output tokens, cost, replies and top models. Plan limits stay Claude's only; OpenCode doesn't report any. |
+| **Projects today** | OpenCode time, prompts, files, lines, commits and cost are added to the same projects (by directory); the hover says *via OpenCode* or *Claude + OpenCode*. |
+
+**Which sessions count as open:** OpenCode runs sessions in a background service, so there's no process per session. A session gets a card while it's working or waiting on you; while it's the newest session in the folder of an open `opencode` terminal (clicking it jumps to that terminal); or for 10 minutes (`OC_OPEN_SECS`) after its last activity.
+
+**The plugin.** OpenCode's database can't tell that a session is waiting on you, so `ccwatch.py --install --opencode` (or *Set Up…* in the widget) adds `~/.config/opencode/plugins/ccwatch.js`. It writes `~/.cache/ccwatch/opencode/<session>.json` when a session starts working, goes idle, or asks for a permission or an answer, and nothing else: it never answers, changes or delays anything. It works with OpenCode 2.x (`setup` and its event stream) and 1.x (`server` and its `event` hook). OpenCode 2.x notices the new plugin and loads it within seconds, with no restart; OpenCode 1.x needs a restart (quit and reopen it). Without it, ccwatch still works out *working* / *idle* from the database, but never *needs you*. `--install` keeps an installed plugin up to date, and `--uninstall` removes it.
+
+**Privacy:** ccwatch opens OpenCode's database read-only and reads only its session and message tables, never the account or credential ones.
 
 ## Reading the dashboard
 
@@ -253,11 +282,12 @@ Each running session gets a card. The robot and colors show its state at a glanc
 | **Needs you** | yellow, pulsing border, waving robot, `▲ NEEDS YOU` | Waiting on a permission prompt, a question, plan approval or an MCP input request. Always sorted first. |
 | **Working** | green, typing robot, light running along the top border, `⠋ WORKING` | Claude is mid-turn. |
 | **Idle** | blue/dim, sleeping robot with drifting `z` | Turn finished, waiting for your next prompt. |
+| **Done · unseen / failed / interrupted** | green / red / yellow badge, sleeping robot | OpenCode only: the turn ended while no OpenCode window showed it. |
 | **Other** | yellow `!` | Claude Code reported a status ccwatch doesn't recognise; the raw status is shown in the badge. |
 
 Card lines, top to bottom:
 
-1. **Title**: the session's custom or auto-generated title (falls back to your last prompt).
+1. **Title**: the session's custom or auto-generated title (falls back to your last prompt). OpenCode cards have `OpenCode` after the project name in the top border.
 2. **`▸ project`**: the working directory name.
 3. **Activity**: `now ⚒ Tool` and its target while working, `last …` when idle, or `approve` / `answer` / `input` with the pending tool when it needs you.
 4. **Timing**: how long it has been in the current state, total uptime, and the model.
@@ -273,6 +303,7 @@ Card lines, top to bottom:
 | **today** | 24 slots, one per hour, of output tokens (current hour pulses, future hours are dots); then output tokens, tokens actually processed (input + cache writes + output), cache reads with hit rate, and number of replies. Counts every transcript today, sub-agents included. |
 | **models** | Share of today's output tokens per model. |
 | **cost** | Summed cost of every session that reported today, and of sessions open now. |
+| **opencode** | With OpenCode monitoring on: today's OpenCode output tokens, tokens processed, cost, replies and top models. |
 
 Pace messages and colors:
 
@@ -319,6 +350,8 @@ ccwatch combines five local data sources, polled once a second (today's token to
 ~/.claude/projects/*/<session>/subagents/     sub-agent transcripts and their task descriptions
 ~/.cache/ccwatch/statusline/<session>.json    saved by the status line: plan limits, cost, context %
 ~/.cache/ccwatch/state/<session>.json         written by ccwatch-hook.sh while a session needs you
+~/.local/share/opencode/opencode.db           with --opencode: OpenCode's sessions and messages (read-only)
+~/.cache/ccwatch/opencode/<session>.json      with --opencode: working / idle / needs you, from the OpenCode plugin
 ```
 
 - **Live sessions**: a session file only counts if its process is still alive, so crashed sessions disappear on their own.
@@ -355,6 +388,8 @@ ccwatch combines five local data sources, polled once a second (today's token to
 - **Sub-agent activity is inferred.** A sub-agent counts as active if its transcript changed in the last 30 seconds.
 - **Project time is an estimate.** It's built from message timestamps, so a single tool call that runs longer than 5 minutes with no messages in between is counted as a break.
 - **Project stats only see Claude's own tools.** Lines and files count Edit and Write changes, not files changed by shell commands or by you. Commits are found by matching `git commit` at the start of a Bash command; ones run through scripts or aliases aren't counted.
+- **OpenCode's database isn't a public API either.** ccwatch reads both its 2.x layout (`session_v2`, `session_message`) and its 1.x one (`session`, `message`, `part`). If an OpenCode update changes it, the OpenCode row in the usage panel says so and Claude monitoring carries on.
+- **OpenCode updates arrive per step.** OpenCode 2.x writes a reply's tool calls to its database when each step ends, so an OpenCode card's current tool and the project's lines can lag a long step. Working / idle / needs you come from the plugin, live.
 - **Projects follow the starting directory.** A session that `cd`s elsewhere stays under the directory it was in at its first message today. Project cost has the same caveat as total cost: a session that started before midnight counts in full.
 
 ## Configuration
@@ -372,9 +407,11 @@ Tunables are constants at the top of `ccwatch.py`:
 | `MAX_CARD_W` | `80` | Maximum card width on wide terminals |
 | `PRUNE_INTERVAL` | `3600` | Seconds between clean-ups of `~/.cache/ccwatch` |
 | `CAPTURE_MAX_AGE` | `8 days` | Status line captures older than this are deleted |
-| `STATE_MAX_AGE` | `1 day` | "Needs you" flags of ended sessions older than this are deleted |
+| `STATE_MAX_AGE` | `1 day` | "Needs you" flags of ended sessions older than this are deleted (and OpenCode plugin records) |
+| `OC_OPEN_SECS` | `600` | How long an idle OpenCode session that no open terminal shows keeps its card |
+| `OC_STALE_SECS` | `600` | Without the plugin, an OpenCode reply with no update for this long counts as abandoned, not working |
 
-Widget settings live in its defaults (`defaults read local.ccwatch.widget`). Most are set from the right-click menu; `notifyAfter` (seconds, default 120) is set with `defaults write`.
+Widget settings live in its defaults (`defaults read local.ccwatch.widget`). Most are set from the right-click menu (`opencode` is *Monitor OpenCode*); `notifyAfter` (seconds, default 120) is set with `defaults write`.
 
 ## Troubleshooting
 
@@ -397,6 +434,9 @@ Start with `python3 ccwatch.py --doctor` (or *Run Diagnostics…* in the widget'
 | Packaged app says "ccwatch.py not found inside or next to ccwidget.app" | The app was built with `build-widget.sh`, not `package.sh`, and then moved away from this folder. Use the app from `dist/`, or rebuild with `./package.sh`. |
 | Packaged app shows "couldn't start python3" | No Python 3 at `/opt/homebrew/bin`, `/usr/local/bin` or `/usr/bin`. Install it (Homebrew, python.org, or the Command Line Tools via `xcode-select --install`), then reopen the app. |
 | "ccwidget" Not Opened, "Apple could not verify…" on another Mac | The app is ad-hoc signed and was downloaded or received, so it's quarantined. Click **Done**, then System Settings → Privacy & Security → **Open Anyway**, or run `xattr -dr com.apple.quarantine /Applications/ccwidget.app`. See `Open Me First.txt` and *Signing* under Packaging. |
+| No *Monitor OpenCode* item in the menu | OpenCode wasn't found: no `~/.local/share/opencode/opencode.db` and no `opencode` command in `/opt/homebrew/bin`, `/usr/local/bin`, `~/.opencode/bin` and similar. |
+| OpenCode sessions never show "needs you" | Run `python3 ccwatch.py --doctor --opencode`. The plugin must be installed (`--install --opencode`); OpenCode 1.x also needs a restart after that. |
+| OpenCode row says "OpenCode: unfamiliar database layout" | An OpenCode update changed its database. Claude monitoring is unaffected; please open an issue with your `opencode --version`. |
 | Floating panel is off-screen after unplugging a display | `defaults delete local.ccwatch.widget` then reopen it; the panel starts in the top-right corner. (The assistant always appears on a connected display.) |
 
 To test the hook by hand:
@@ -409,8 +449,8 @@ rm ~/.cache/ccwatch/state/test.json
 
 ## Uninstall
 
-1. Run `python3 ccwatch.py --uninstall` (`--dry-run` first to preview). It removes the hook entries whose command contains `ccwatch-hook.sh` and the `# ccwatch:` block from your status line script, or the whole `ccwatch-statusline.sh` status line if `--install` created it. Restoring the backups (`~/.claude/settings.json.bak-ccwatch`, `<status line script>.bak`) also works, but only if you haven't changed those files since.
-2. Delete `~/.claude/ccwatch-hook.sh` if `--install` copied it there from a packaged app.
+1. Run `python3 ccwatch.py --uninstall` (`--dry-run` first to preview). It removes the hook entries whose command contains `ccwatch-hook.sh` and the `# ccwatch:` block from your status line script, or the whole `ccwatch-statusline.sh` status line if `--install` created it, and the OpenCode plugin `~/.config/opencode/plugins/ccwatch.js` if it's there. Restoring the backups (`~/.claude/settings.json.bak-ccwatch`, `<status line script>.bak`) also works, but only if you haven't changed those files since.
+2. Delete `~/.claude/ccwatch-hook.sh` if `--install` copied it there from a packaged app. OpenCode 2.x unloads the removed plugin by itself; restart OpenCode 1.x.
 3. Delete the saved data: `rm -rf ~/.cache/ccwatch`.
 4. If you used the widget: quit it, remove it from Login Items, delete `ccwidget.app` (and `/Applications/ccwidget.app` if you installed a packaged copy), and run `defaults delete local.ccwatch.widget` to forget its position and settings.
 

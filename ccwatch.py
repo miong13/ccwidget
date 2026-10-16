@@ -10,22 +10,30 @@ files from its own ~/.cache/ccwatch):
       ~/.claude/statusline-command.sh (cost, context %, plan rate limits)
   ~/.cache/ccwatch/state/<sessionId>.json  "waiting on you" flag written by
       ccwatch-hook.sh (permission prompts, questions, MCP input requests)
+With --opencode, OpenCode sessions too:
+  ~/.local/share/opencode/opencode.db      OpenCode's database, opened read-only
+  ~/.cache/ccwatch/opencode/<sessionId>.json  working / idle / "waiting on you", written by
+      the ccwatch OpenCode plugin (ccwatch-opencode.js)
 
 The usage and "projects today" panels come from one incremental scan of every
 transcript changed today (tokens, time spent, prompts, edits, commits per directory).
 
 Keys: q quit · i hide/show idle sessions · u compact/expand usage and projects panels
-Usage: ccwatch.py [--once] [--json]   (--json streams one snapshot per second; with --once, just one)
+      o show/hide OpenCode sessions (when OpenCode is installed)
+Usage: ccwatch.py [--once] [--json] [--opencode]   (--json streams one snapshot per second;
+                                     with --once, just one. --opencode adds OpenCode sessions)
        ccwatch.py --focus <pid>        bring the terminal/editor window running that session forward
-       ccwatch.py --install [--dry-run]     add the hook and status line capture to ~/.claude
+       ccwatch.py --install [--opencode] [--dry-run]   add the hook and status line capture to
+                                     ~/.claude (and with --opencode, the OpenCode plugin)
        ccwatch.py --uninstall [--dry-run]   remove them again
-       ccwatch.py --doctor             check every data source and say what's missing
+       ccwatch.py --doctor [--opencode]     check every data source and say what's missing
 """
 import curses
 import glob
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from collections import deque
@@ -48,6 +56,18 @@ IDLE_GAP = 300             # pauses longer than this between transcript events d
 PRUNE_INTERVAL = 3600      # seconds between clean-ups of ~/.cache/ccwatch
 CAPTURE_MAX_AGE = 8 * 86400   # status line captures older than this are deleted (longest limit window + a day)
 STATE_MAX_AGE = 86400      # "needs you" flags of sessions that are gone and this old are deleted
+
+XDG_DATA = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+OC_DB = os.path.join(XDG_DATA, "opencode", "opencode.db")
+OC_PLUGIN_NAME = "ccwatch-opencode.js"
+OC_PLUGIN = os.path.join(XDG_CONFIG, "opencode", "plugins", "ccwatch.js")
+OC_STATE_DIR = os.path.join(HOME, ".cache", "ccwatch", "opencode")
+OC_BINS = ("/opt/homebrew/bin/opencode", "/usr/local/bin/opencode", "~/.opencode/bin/opencode",
+           "~/.local/bin/opencode", "~/.bun/bin/opencode", "~/.npm-global/bin/opencode")
+OC_OPEN_SECS = 600         # an idle OpenCode session no terminal shows keeps its card this long
+OC_STALE_SECS = 600        # without the plugin, an unfinished reply this quiet counts as abandoned
+OC_CLIENT_INTERVAL = 5.0   # seconds between looks for running OpenCode terminals
 
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 SPARK = "▁▁▂▃▄▅▆▇█"  # index 0 = no activity
@@ -100,11 +120,12 @@ def read_tail(path, n=TAIL_BYTES):
 def summarize_input(inp):
     if not isinstance(inp, dict):
         return ""
-    for key in ("description", "command", "file_path", "pattern", "url", "query", "prompt", "skill"):
+    for key in ("description", "command", "file_path", "pattern", "url", "query", "prompt", "skill",
+                "filePath", "path"):  # the last two: OpenCode's names
         v = inp.get(key)
         if isinstance(v, str) and v.strip():
-            if key == "file_path":
-                v = os.path.basename(v)
+            if key in ("file_path", "filePath", "path"):
+                v = os.path.basename(v.rstrip("/")) or v
             return v.strip().splitlines()[0]
     return ""
 
@@ -171,6 +192,10 @@ class SubAgent:
 
 
 class Session:
+    source = "claude"
+    attention = None  # OpenCode only: a finished turn you haven't seen ("unseen", "failed", "interrupted")
+    outcome = None    # OpenCode only: how its last turn ended
+
     def __init__(self, pid):
         self.pid = pid
         self.sid = None
@@ -316,6 +341,7 @@ class Project:
         self.files = set()         # files changed by Edit / Write
         self.added = self.removed = 0
         self.commits = 0
+        self.sources = set()       # "claude", "opencode"
         # derived in TokenLedger.summarize()
         self.active, self.hourly = 0.0, [0.0] * 24
         self.first = self.last = 0.0
@@ -328,15 +354,19 @@ class TokenLedger:
 
     Reads each file incrementally; assistant messages are written in several
     lines sharing one message id, so usage is keyed by id and the last one wins.
+    With an OpenCode reader, its sessions' work joins the same projects.
     """
 
-    def __init__(self):
+    def __init__(self, oc=None):
+        self.oc = oc
         self.day = None
         self.last_scan = 0.0
         self._reset(None)
 
     def _reset(self, day):
         self.day = day
+        if self.oc:
+            self.oc.reset_day(day)
         self.offsets = {}
         self.usage = {}
         self.projects = {}         # cwd -> Project
@@ -361,6 +391,8 @@ class TokenLedger:
             if st.st_mtime < midnight or st.st_size == self.offsets.get(path, 0):
                 continue
             self._read(path, self.offsets.get(path, 0))
+        if self.oc:
+            self.oc.scan(self, midnight)
         if self.dirty:
             self.summarize(midnight)
         self.last_scan = time.time()
@@ -398,6 +430,7 @@ class TokenLedger:
             if p is None:
                 p = self.projects[key] = Project(key)
             p.sessions.add(sid)
+            p.sources.add("claude")
             p.stamps.append(ts.timestamp())
             if e.get("gitBranch") and e["gitBranch"] != "HEAD":
                 p.branch = e["gitBranch"]
@@ -479,6 +512,9 @@ class TokenLedger:
         for *_, out, _hour, _model, key in self.usage.values():
             if key in self.projects:
                 self.projects[key].output += out
+        for key, out in (self.oc.project_output() if self.oc else {}).items():
+            if key in self.projects:
+                self.projects[key].output += out
         self.dirty = False
 
     def totals(self):
@@ -495,9 +531,555 @@ class TokenLedger:
                 "hourly": hourly, "models": models}
 
 
+# ─── OpenCode (opt-in: --opencode) ───────────────────────────────────────────
+# OpenCode keeps its sessions in one SQLite database. ccwatch opens it read-only
+# and reads only the session and message tables (never the account or credential
+# ones). The database can't say that a session waits on you; the ccwatch plugin
+# (ccwatch-opencode.js) records that, and working / idle, in OC_STATE_DIR.
+
+_oc_installed = {"at": 0.0, "value": False}
+
+# subcommands that aren't an interactive session (`opencode`, `opencode run`, `opencode mini` are)
+OC_TOOLS = {"serve", "service", "web", "acp", "api", "attach", "auth", "debug", "mcp", "models", "plugin",
+            "session", "stats", "export", "import", "github", "pr", "upgrade", "update", "uninstall", "agent"}
+
+
+def opencode_installed():
+    """Whether OpenCode is on this Mac: its database, or its command in a usual place.
+    Checked once a minute (mid-update, the command can be missing for a while)."""
+    import shutil
+    if time.time() - _oc_installed["at"] > 60:
+        found = os.path.exists(OC_DB) or bool(shutil.which("opencode")) or any(
+            os.access(os.path.expanduser(p), os.X_OK) for p in OC_BINS)
+        _oc_installed.update(at=time.time(), value=found)
+    return _oc_installed["value"]
+
+
+def opencode_clients(cwds):
+    """{directory: pid} of the OpenCode terminals running now (not its background
+    service). `cwds` caches each pid's working directory, so lsof only runs for new ones."""
+    import subprocess
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,args="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    procs = {}  # pid -> directory given on the command line, or ""
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        argv = parts[1:]
+        if os.path.basename(argv[0]) in ("node", "bun") and len(argv) > 1:
+            argv = argv[1:]
+        if os.path.basename(argv[0]) not in ("opencode", "opencode.exe"):
+            continue
+        words = [a for a in argv[1:] if not a.startswith("-")]
+        if words and words[0] in OC_TOOLS:
+            continue
+        arg = words[0] if words and os.path.isabs(words[0]) and os.path.isdir(words[0]) else ""
+        procs[int(parts[0])] = arg.rstrip("/")
+    new = [p for p in procs if not procs[p] and p not in cwds]
+    if new:
+        lsof = "/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else "lsof"
+        try:
+            out = subprocess.run([lsof, "-a", "-d", "cwd", "-Fn", "-p", ",".join(map(str, new))],
+                                 capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        pid = None
+        for line in out.splitlines():
+            if line.startswith("p") and line[1:].isdigit():
+                pid = int(line[1:])
+            elif line.startswith("n") and pid:
+                cwds[pid] = line[1:].rstrip("/")
+    for p in list(cwds):
+        if p not in procs:
+            del cwds[p]
+    return {(d or cwds.get(p)): p for p, d in procs.items() if d or cwds.get(p)}
+
+
+def oc_v2_message(kind, data, created=0):
+    """An OpenCode message in one shape whichever database layout it came from:
+    {role, created, completed (ms), model (provider, id), tokens, cost, content, text}."""
+    t = data.get("time") or {}
+    m = data.get("model") or {}
+    return {"role": kind, "created": t.get("created") or created, "completed": t.get("completed"),
+            "model": (m.get("providerID") or "", m.get("id") or m.get("modelID") or ""),
+            "tokens": data.get("tokens") or {}, "cost": data.get("cost") or 0,
+            "content": [c for c in data.get("content") or () if isinstance(c, dict)],
+            "text": data.get("text") if isinstance(data.get("text"), str) else ""}
+
+
+def oc_v1_message(data, parts, created=0):
+    """oc_v2_message() for OpenCode 1.x, whose message content lives in separate parts."""
+    content, text = [], []
+    for p in parts:
+        kind = p.get("type")
+        if kind == "tool":
+            content.append({"type": "tool", "id": p.get("callID") or p.get("id"), "name": p.get("tool") or "",
+                            "state": p.get("state") or {}})
+        elif kind == "text":
+            content.append({"type": "text", "text": p.get("text") or ""})
+            if not p.get("synthetic"):
+                text.append(p.get("text") or "")
+        elif kind == "reasoning":
+            content.append({"type": "reasoning"})
+    t = data.get("time") or {}
+    m = data.get("model") or {}
+    return {"role": data.get("role") or "", "created": t.get("created") or created, "completed": t.get("completed"),
+            "model": (data.get("providerID") or m.get("providerID") or "", data.get("modelID") or m.get("modelID") or ""),
+            "tokens": data.get("tokens") or {}, "cost": data.get("cost") or 0, "content": content,
+            "text": "\n".join(text)}
+
+
+def oc_activity(msg):
+    """("tool" | "text" | "think", label, detail) from a session's newest message, like scan_transcript()."""
+    if msg["role"] != "assistant":
+        return ("think", "Reading prompt", "")
+    for item in reversed(msg["content"]):
+        kind = item.get("type")
+        if kind == "tool":
+            name = item.get("name") or "?"
+            return ("tool", name[:1].upper() + name[1:], summarize_input((item.get("state") or {}).get("input")))
+        if kind == "text":
+            lines = (item.get("text") or "").strip().splitlines()
+            return ("text", "Writing", lines[0] if lines else "")
+        if kind == "reasoning":
+            return ("think", "Thinking", "")
+    return ("think", "Thinking", "")
+
+
+def oc_used(tokens):
+    """Tokens in the context window after a reply: what went in, cached or not, plus what came out."""
+    cache = tokens.get("cache") or {}
+    return sum(int(v or 0) for v in (tokens.get("input"), cache.get("read"), cache.get("write"),
+                                     tokens.get("output"), tokens.get("reasoning")))
+
+
+class OCSub:
+    """An OpenCode sub-agent: a child session, shown like a Claude sub-agent."""
+    kind = "agent"
+
+    def __init__(self, desc, mtime):
+        self.desc, self.mtime = desc, mtime
+
+
+class OCSession(Session):
+    """An open OpenCode session. It has everything Session has, so the cards, the
+    widget feed and the projects panel handle both the same way."""
+    source = "opencode"
+
+    def __init__(self, sid):
+        super().__init__(None)
+        self.sid = sid
+        self.key = self.size = self.msg = None  # newest message: (id, updated), its size, the message
+        self.ctx = None
+
+    def update(self, oc, row, states, kids, pid):
+        now = time.time()
+        self.pid = pid  # the terminal running it, when one is open in its directory
+        key, size, msg, turn = oc.latest(self.sid, self.key)
+        if msg is not None:
+            self.msg = msg
+        if self.size is not None and key:  # the newest message grew, or a new one began
+            self.spark.append(max(0, size - self.size) if self.key and key[0] == self.key[0] else size)
+        else:
+            self.spark.append(0)
+        self.key, self.size = key, size
+        msg = self.msg
+
+        rec = states.get(self.sid)
+        idle_at = row.get("time_idle")  # OpenCode 2.0.30+ records when each turn ended, and how
+        if rec:  # the plugin knows
+            busy, since = rec["state"] != "idle", rec.get("since") or now
+        else:  # infer it: a reply still being written, or a prompt not yet answered
+            fresh = now - (row.get("time_updated") or 0) / 1000 < OC_STALE_SECS
+            if idle_at and turn:  # a turn is over once OpenCode marks it idle (2.0.30+)
+                busy = fresh and idle_at < turn
+            else:
+                busy = bool(msg) and fresh and (msg["role"] == "user" or not msg["completed"])
+            done = idle_at or (msg and msg["role"] == "assistant" and msg["completed"])
+            since = ((turn if busy else done) or row.get("time_updated") or 0) / 1000
+        self.info = {"cwd": row.get("directory") or "", "status": "busy" if busy else "idle",
+                     "statusUpdatedAt": since * 1000, "startedAt": row.get("time_created")}
+
+        self.wait = None  # a prompt open in it or in one of its sub-agents
+        for r in [rec] + [states.get(k["id"]) for k in kids]:
+            if r and r.get("state") == "waiting":
+                self.wait = {"state": "waiting", "reason": r.get("reason") or "permission", "tool": r.get("tool") or "",
+                             "detail": r.get("detail") or "", "since": r.get("since") or now}
+                break
+
+        # a turn that ended while no OpenCode window showed it: OpenCode marks it viewed once one does
+        self.outcome = row.get("idle_outcome") if idle_at else None
+        unseen = bool(idle_at) and (row.get("time_viewed") or 0) < idle_at
+        self.attention = None if busy or self.wait or not unseen else \
+            {"failed": "failed", "interrupted": "interrupted"}.get(self.outcome, "unseen")
+
+        title = (row.get("title") or "").strip()
+        self.title = None if not title or title.startswith("New session - ") else title
+        if msg and msg["role"] == "assistant":
+            self.model = oc.model_name(msg["model"])
+            limit = oc.context_limit(msg["model"])
+            self.ctx = min(100.0, oc_used(msg["tokens"]) / limit * 100) if limit else None
+        self.activity = oc_activity(msg) if msg else None
+        self.sl = {"context_window": {"used_percentage": self.ctx} if self.ctx is not None else {},
+                   "cost": {"total_cost_usd": row.get("cost"), "total_lines_added": row.get("summary_additions"),
+                            "total_lines_removed": row.get("summary_deletions")}}
+        self.subs = {}
+        for k in kids:
+            r = states.get(k["id"])
+            active = r and r.get("state") != "idle"
+            self.subs[k["id"]] = OCSub(k.get("title") or "sub-agent", now if active else (k.get("time_updated") or 0) / 1000)
+
+
+class OpenCode:
+    """OpenCode's open sessions and today's usage, read from its database (read-only)
+    and the ccwatch plugin's state files. Every read is guarded: if OpenCode changes
+    its database, ccwatch reports it in `error` and carries on with Claude alone."""
+
+    COLS = ("id", "parent_id", "directory", "title", "time_created", "time_updated", "time_archived",
+            "cost", "summary_additions", "summary_deletions",
+            "time_idle", "time_viewed", "idle_outcome")  # the last three: OpenCode 2.0.30+
+
+    def __init__(self, path=None, state_dir=None):
+        self.path = path or OC_DB
+        self.state_dir = state_dir or OC_STATE_DIR
+        self.db = None
+        self.v2 = True           # session_v2 / session_message (2.x); False: session / message / part (1.x)
+        self.cols = ""
+        self.error = None
+        self.rows = {}           # session id -> its row, for sessions changed recently
+        self.rows_mark = 0       # newest time_updated read, ms
+        self.sessions = {}       # session id -> OCSession, the open ones
+        self.clients, self.client_cwds, self.clients_at = {}, {}, 0.0
+        self.catalog, self.catalog_key, self.catalog_at = {}, None, 0.0
+        self.reset_day(None)
+
+    def reset_day(self, day):
+        self.day = day
+        self.midnight = 0.0
+        self.mark = 0            # newest message time_updated read today, ms
+        self.seen = {}           # message id -> time_updated last counted
+        self.usage = {}          # message id -> (input, cache write, cache read, output, hour, model, project, cost)
+        self.counted = set()     # prompts and tool calls already counted
+        self.stamped = set()     # message timestamps already added to a project
+
+    # database ----------------------------------------------------------------
+
+    def connect(self):
+        if self.db is None:
+            if not os.path.exists(self.path):
+                raise sqlite3.OperationalError(f"no database at {tilde(self.path)}")
+            from urllib.parse import quote
+            db = sqlite3.connect(f"file:{quote(self.path)}?mode=ro", uri=True, timeout=1)
+            db.row_factory = sqlite3.Row
+            tables = {r[0] for r in db.execute("select name from sqlite_master where type = 'table'")}
+            if {"session_v2", "session_message"} <= tables:
+                self.v2 = True
+            elif {"session", "message", "part"} <= tables:
+                self.v2 = False
+            else:
+                db.close()
+                raise sqlite3.OperationalError("unfamiliar database layout; an OpenCode update may have changed it")
+            have = {r[1] for r in db.execute(f"pragma table_info({self.table})")}
+            self.cols = ", ".join(c for c in self.COLS if c in have)
+            self.db = db
+        return self.db
+
+    @property
+    def table(self):
+        return "session_v2" if self.v2 else "session"
+
+    def close(self):
+        if self.db is not None:
+            try:
+                self.db.close()
+            except sqlite3.Error:
+                pass
+            self.db = None
+
+    def _guard(self, fn, *args):
+        try:
+            fn(*args)
+            self.error = None
+        except (sqlite3.Error, ValueError, TypeError, KeyError, AttributeError) as e:
+            self.error = f"OpenCode: {e}"
+            self.close()  # reconnect next time, in case OpenCode replaced the file
+
+    def _load_rows(self, since):
+        for r in self.db.execute(f"select {self.cols} from {self.table} where time_updated >= ?", (since,)):
+            d = dict(r)
+            self.rows[d["id"]] = d
+            self.rows_mark = max(self.rows_mark, d.get("time_updated") or 0)
+
+    def row(self, sid):
+        if sid and sid not in self.rows:
+            r = self.db.execute(f"select {self.cols} from {self.table} where id = ?", (sid,)).fetchone()
+            if r:
+                self.rows[sid] = dict(r)
+        return self.rows.get(sid)
+
+    def _newest_in(self, directory):
+        """The most recently used top-level session in a directory (the one its open terminal shows)."""
+        archived = " and time_archived is null" if "time_archived" in self.cols else ""
+        r = self.db.execute(f"select {self.cols} from {self.table} where directory = ? and parent_id is null"
+                            f"{archived} order by time_updated desc limit 1", (directory,)).fetchone()
+        if r:
+            self.rows[r["id"]] = dict(r)
+            return self.rows[r["id"]]
+        return None
+
+    def latest(self, sid, have=None):
+        """(key, size, message, turn) for a session's newest user or assistant message.
+        The message is read only when its key (id, time updated) differs from `have`;
+        turn is when its newest prompt was sent (ms)."""
+        db = self.db
+        if self.v2:
+            r = db.execute("select id, type, time_created, time_updated, length(data) from session_message "
+                           "where session_id = ? and type in ('user', 'assistant') order by seq desc limit 1",
+                           (sid,)).fetchone()
+            if not r:
+                return None, 0, None, None
+            turn = db.execute("select max(time_created) from session_message where session_id = ? and type = 'user'",
+                              (sid,)).fetchone()[0]
+            key = (r[0], r[3])
+            if key == have:
+                return key, r[4], None, turn
+            data = json.loads(db.execute("select data from session_message where id = ?", (r[0],)).fetchone()[0])
+            return key, r[4], oc_v2_message(r[1], data, r[2]), turn
+        r = db.execute("select id, time_created, time_updated, length(data) from message where session_id = ? "
+                       "order by time_created desc, id desc limit 1", (sid,)).fetchone()
+        if not r:
+            return None, 0, None, None
+        turn = db.execute("select max(time_created) from message where session_id = ? "
+                          "and json_extract(data, '$.role') = 'user'", (sid,)).fetchone()[0]
+        newest, total = db.execute("select max(time_updated), sum(length(data)) from part where message_id = ?",
+                                   (r[0],)).fetchone()
+        key, size = (r[0], max(r[2], newest or 0)), r[3] + (total or 0)
+        if key == have:
+            return key, size, None, turn
+        data = json.loads(db.execute("select data from message where id = ?", (r[0],)).fetchone()[0])
+        parts = [json.loads(p[0]) for p in db.execute("select data from part where message_id = ? order by id", (r[0],))]
+        return key, size, oc_v1_message(data, parts, r[1]), turn
+
+    # models ------------------------------------------------------------------
+
+    def _load_catalog(self):
+        """Display names and context windows of models, from the models.dev list OpenCode caches."""
+        if time.time() - self.catalog_at < 600:
+            return
+        self.catalog_at = time.time()
+        try:
+            r = self.db.execute("select time_updated from kv where key = 'models-dev:catalog'").fetchone()
+        except sqlite3.Error:  # 1.x keeps it elsewhere
+            return
+        if not r or r[0] == self.catalog_key:
+            return
+        value = json.loads(self.db.execute("select value from kv where key = 'models-dev:catalog'").fetchone()[0])
+        body = value.get("body", value) if isinstance(value, dict) else {}
+        body = json.loads(body) if isinstance(body, str) else body
+        catalog = {}
+        for prov, p in (body or {}).items():
+            for mid, m in ((p or {}).get("models") or {}).items() if isinstance(p, dict) else ():
+                if isinstance(m, dict):
+                    catalog[(prov, mid)] = (m.get("name") or mid, (m.get("limit") or {}).get("context"))
+        self.catalog, self.catalog_key = catalog, r[0]
+
+    def model_name(self, model):
+        return (self.catalog.get(tuple(model)) or (None,))[0] or model[1]
+
+    def context_limit(self, model):
+        return (self.catalog.get(tuple(model)) or (None, None))[1]
+
+    # live sessions -------------------------------------------------------------
+
+    def states(self):
+        """The plugin's newest record per session, from OpenCode processes still running."""
+        out = {}
+        for path in glob.glob(os.path.join(self.state_dir, "*.json")):
+            rec = load_json(path)
+            if isinstance(rec, dict) and rec.get("state") and isinstance(rec.get("pid"), int) and pid_alive(rec["pid"]):
+                out[os.path.basename(path)[:-len(".json")]] = rec
+        return out
+
+    def refresh(self):
+        self._guard(self._refresh)
+
+    def _refresh(self):
+        now = time.time()
+        self.connect()
+        self._load_catalog()
+        if self.rows_mark:
+            self._load_rows(self.rows_mark)
+        else:
+            midnight = datetime.combine(date.today(), datetime.min.time()).timestamp()
+            self._load_rows(int(min(midnight, now - OC_OPEN_SECS) * 1000))
+        if now - self.clients_at >= OC_CLIENT_INTERVAL:
+            self.clients, self.clients_at = opencode_clients(self.client_cwds), now
+        states = self.states()
+
+        # open: changed in the last OC_OPEN_SECS, working or waiting, or shown in an open terminal
+        want = {sid: r for sid, r in self.rows.items() if not r.get("parent_id") and not r.get("time_archived")
+                and (r.get("time_updated") or 0) >= (now - OC_OPEN_SECS) * 1000}
+        for sid, rec in states.items():
+            r = self.row(sid) if rec.get("state") != "idle" else None
+            root = self.row(r.get("parent_id")) if r and r.get("parent_id") else r  # a sub-agent shows on its parent
+            if root and not root.get("parent_id"):
+                want[root["id"]] = root
+        for directory in self.clients:
+            if not any(r.get("directory") == directory for r in want.values()):
+                r = self._newest_in(directory)
+                if r:
+                    want[r["id"]] = r
+
+        for sid, r in want.items():
+            s = self.sessions.get(sid) or OCSession(sid)
+            kids = [k for k in self.rows.values() if k.get("parent_id") == sid]
+            s.update(self, r, states, kids, self.clients.get(r.get("directory")))
+            self.sessions[sid] = s
+        for sid in list(self.sessions):
+            if sid not in want:
+                del self.sessions[sid]
+
+    # today's usage -------------------------------------------------------------
+
+    def scan(self, ledger, midnight):
+        """Add today's OpenCode work to the ledger's projects: time, prompts, edits, commits, tokens."""
+        self._guard(self._scan, ledger, midnight)
+
+    def _scan(self, ledger, midnight):
+        if self.day != ledger.day:
+            self.reset_day(ledger.day)
+        self.midnight = midnight
+        self.connect()
+        self._load_catalog()
+        top = self.mark
+        for mid, sid, updated, load in self._changed(int(midnight * 1000)):
+            top = max(top, updated)
+            if self.seen.get(mid) != updated:
+                self.seen[mid] = updated
+                self._count(ledger, mid, sid, load())
+        self.mark = top
+
+    def _changed(self, since):
+        """(message id, session id, time updated, loader) for today's messages changed since the last scan."""
+        db = self.db
+        if self.v2:
+            q = ("select id, session_id, type, time_created, time_updated, data from session_message "
+                 "where time_created >= ? and time_updated >= ? and type in ('user', 'assistant')")
+            for r in db.execute(q, (since, self.mark)).fetchall():
+                yield r[0], r[1], r[4], lambda r=r: oc_v2_message(r[2], json.loads(r[5]), r[3])
+            return
+        ids = {r[0] for r in db.execute("select id from message where time_created >= ? and time_updated >= ?",
+                                        (since, self.mark))}
+        ids |= {r[0] for r in db.execute("select distinct message_id from part where time_created >= ? "
+                                         "and time_updated >= ?", (since, self.mark))}
+        ids = sorted(ids)
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            parts = {}
+            for m, updated, data in db.execute(f"select message_id, time_updated, data from part "
+                                               f"where message_id in ({marks}) order by id", chunk):
+                parts.setdefault(m, []).append((updated, data))
+            for r in db.execute(f"select id, session_id, time_created, time_updated, data from message "
+                                f"where id in ({marks})", chunk).fetchall():
+                ps = parts.get(r[0], [])
+                updated = max([r[3]] + [u for u, _ in ps])
+                yield r[0], r[1], updated, lambda r=r, ps=ps: oc_v1_message(
+                    json.loads(r[4]), [json.loads(d) for _, d in ps], r[2])
+
+    def _count(self, ledger, mid, sid, msg):
+        row = self.row(sid) or {}
+        key = (row.get("directory") or "").rstrip("/")
+        if not key or msg["created"] / 1000 < self.midnight:
+            return
+        p = ledger.projects.get(key)
+        if p is None:
+            p = ledger.projects[key] = Project(key)
+        p.sessions.add("oc:" + (row.get("parent_id") or sid))
+        p.sources.add("opencode")
+        ledger.dirty = True
+        for tag, ms in (("sent", msg["created"]), ("done", msg["completed"])):
+            if ms and (mid, tag) not in self.stamped:
+                self.stamped.add((mid, tag))
+                p.stamps.append(ms / 1000)
+        if msg["role"] == "user":  # a prompt you typed; a sub-agent's task prompt doesn't count
+            if not row.get("parent_id") and msg["text"].strip() and (mid, "prompt") not in self.counted:
+                self.counted.add((mid, "prompt"))
+                p.prompts += 1
+            return
+        if msg["role"] != "assistant":
+            return
+        tok = msg["tokens"]
+        cache = tok.get("cache") or {}
+        self.usage[mid] = (int(tok.get("input") or 0), int(cache.get("write") or 0), int(cache.get("read") or 0),
+                           int(tok.get("output") or 0) + int(tok.get("reasoning") or 0),
+                           datetime.fromtimestamp(msg["created"] / 1000).hour, self.model_name(msg["model"]), key,
+                           float(msg["cost"] or 0))
+        for i, item in enumerate(msg["content"]):
+            st = item.get("state") or {}
+            if item.get("type") == "tool" and st.get("status") == "completed" and (mid, item.get("id") or i) not in self.counted:
+                self.counted.add((mid, item.get("id") or i))
+                self._tool(p, item.get("name") or "", st)
+
+    @staticmethod
+    def _tool(p, name, st):
+        """Files, lines and commits from one finished tool call."""
+        inp, meta = st.get("input") or {}, st.get("metadata") or {}
+        if name in ("bash", "shell"):  # a commit counts once its command succeeded
+            cmd = inp.get("command")
+            if isinstance(cmd, str) and GIT_COMMIT.search(cmd) and meta.get("exit") in (0, None):
+                p.commits += 1
+            return
+        diffs = [meta["filediff"]] if isinstance(meta.get("filediff"), dict) else \
+            [d for d in meta.get("files") or () if isinstance(d, dict)]
+        for d in diffs:
+            path = d.get("file") or d.get("filePath") or d.get("path")
+            if path:
+                p.files.add(os.path.normpath(os.path.join(p.cwd, path)))  # 2.x tools may give it relative
+                p.added += int(d.get("additions") or 0)
+                p.removed += int(d.get("deletions") or 0)
+        if not diffs and name == "write" and isinstance(inp.get("content"), str):
+            path = inp.get("filePath") or inp.get("path")
+            if path:
+                p.files.add(os.path.normpath(os.path.join(p.cwd, path)))
+                p.added += len(inp["content"].splitlines())
+
+    def project_output(self):
+        out = {}
+        for *_, o, _hour, _model, key, _cost in self.usage.values():
+            out[key] = out.get(key, 0) + o
+        return out
+
+    def project_cost(self):
+        out = {}
+        for *_, key, cost in self.usage.values():
+            out[key] = out.get(key, 0.0) + cost
+        return out
+
+    def totals(self):
+        """Today's OpenCode tokens, cost and replies, shaped like TokenLedger.totals()."""
+        inp = cw = cr = out = 0
+        cost, hourly, models = 0.0, [0] * 24, {}
+        for a, b, c, d, hour, model, _key, usd in self.usage.values():
+            inp += a; cw += b; cr += c; out += d; cost += usd
+            hourly[hour] += d
+            if model:
+                models[model] = models.get(model, 0) + d
+        return {"input": inp, "cache_write": cw, "cache_read": cr, "output": out, "cost": cost,
+                "total": inp + cw + cr + out, "messages": len(self.usage), "hourly": hourly, "models": models}
+
+
+def oc_plugin_installed():
+    return MARKER_JS in (read_text(OC_PLUGIN) or "")
+
+
 class Store:
-    def __init__(self):
+    def __init__(self, opencode=False):
         self.sessions = {}
+        self.oc = None
         self.ledger = TokenLedger()
         self.limits = None       # rate_limits from the newest status line capture
         self.limits_at = 0.0
@@ -505,16 +1087,30 @@ class Store:
         self.cost_sessions = 0
         self.project_cost = {}   # cwd -> summed session cost today
         self.last_prune = 0.0
+        self.set_opencode(opencode)
+
+    def set_opencode(self, on):
+        """Start or stop showing OpenCode; today's projects are rescanned to add or drop its work."""
+        if bool(on) == bool(self.oc):
+            return
+        if self.oc:
+            self.oc.close()
+        self.oc = OpenCode() if on else None
+        self.ledger = TokenLedger(self.oc)
+
+    def all_sessions(self):
+        return list(self.sessions.values()) + (list(self.oc.sessions.values()) if self.oc else [])
 
     def prune(self):
         """Delete ccwatch's own stale cache files: old status line captures, and
-        "needs you" flags left behind by sessions that crashed. The terminal
-        dashboard and the widget's feed may both do this at once, so a file that
-        has already gone is fine."""
+        "needs you" flags left behind by sessions that crashed (or OpenCode plugin
+        records of sessions long finished). The terminal dashboard and the widget's
+        feed may both do this at once, so a file that has already gone is fine."""
         now = time.time()
-        live = {s.sid for s in self.sessions.values()}
+        live = {s.sid for s in self.all_sessions()}
         for pattern, max_age in ((os.path.join(STATUSLINE_DIR, "*.json"), CAPTURE_MAX_AGE),
-                                 (os.path.join(STATE_DIR, "*.json"), STATE_MAX_AGE)):
+                                 (os.path.join(STATE_DIR, "*.json"), STATE_MAX_AGE),
+                                 (os.path.join(OC_STATE_DIR, "*.json"), STATE_MAX_AGE)):
             for path in glob.glob(pattern):
                 if os.path.basename(path)[:-len(".json")] in live:
                     continue
@@ -543,6 +1139,8 @@ class Store:
         for pid in list(self.sessions):
             if pid not in seen:
                 del self.sessions[pid]
+        if self.oc:
+            self.oc.refresh()
 
         # plan limits are account-wide: take them from whichever session reported last
         captures = []
@@ -571,6 +1169,9 @@ class Store:
                 n += 1
                 key = self.ledger.sess_proj.get(d.get("session_id")) or d.get("cwd")
                 by_proj[key] = by_proj.get(key, 0.0) + c
+        for key, c in (self.oc.project_cost() if self.oc else {}).items():
+            if c:
+                by_proj[key] = by_proj.get(key, 0.0) + c
         self.cost_today, self.cost_sessions, self.project_cost = cost, n, by_proj
 
         if time.time() - self.ledger.last_scan >= LEDGER_INTERVAL:
@@ -579,15 +1180,15 @@ class Store:
             self.prune()
 
     def ordered(self):
-        return sorted(self.sessions.values(),
-                      key=lambda s: (not s.waiting, not s.busy, s.idle, -(s.info.get("startedAt") or 0)))
+        return sorted(self.all_sessions(),
+                      key=lambda s: (not s.waiting, not s.busy, not s.attention, s.idle, -(s.info.get("startedAt") or 0)))
 
     def projects_today(self):
         """Today's projects by time spent, each with the liveliest state of its open sessions."""
         rank = {"wait": 3, "busy": 2, "idle": 1, "other": 1}
         live = {}
-        for s in self.sessions.values():
-            key = self.ledger.sess_proj.get(s.sid) or s.info.get("cwd")
+        for s in self.all_sessions():
+            key = self.ledger.sess_proj.get(s.sid) or (s.info.get("cwd") or "").rstrip("/")
             st = state_of(s)
             if rank[st] > rank.get(live.get(key), 0):
                 live[key] = st
@@ -749,10 +1350,18 @@ def card_height(s):
     return 9 + min(3, len(s.active_subs()))
 
 
+ATTENTION = {  # an OpenCode turn that ended unseen: (badge, color, verb)
+    "unseen": (" ✓ DONE · UNSEEN ", C_BUSY, "done"),
+    "failed": (" ✗ FAILED ", C_DANGER, "failed"),
+    "interrupted": (" ■ INTERRUPTED ", C_WARN, "interrupted"),
+}
+
+
 def draw_card(sc, s, y, x, w, h, f):
     st = state_of(s)
-    col = state_color(s)
-    border = col | (curses.A_BOLD if st == "busy" else curses.A_DIM if st == "idle" else 0)
+    att = ATTENTION.get(s.attention) if st == "idle" else None
+    col = curses.color_pair(att[1]) if att else state_color(s)
+    border = col | (curses.A_BOLD if st == "busy" else curses.A_DIM if st == "idle" and not att else 0)
     if st == "wait" and (f // 6) % 2:  # pulse
         border = col | curses.A_BOLD
     dim = curses.color_pair(C_DIM) | curses.A_DIM
@@ -767,11 +1376,15 @@ def draw_card(sc, s, y, x, w, h, f):
         sc.put(y + r, x, "│", border)
         sc.put(y + r, x + w - 1, "│", border)
     sc.put(y + h - 1, x, "╰" + "─" * (w - 2) + "╯", border)
-    sc.put(y, x + 2, f" {clip(s.name, w - 22)} ", curses.A_BOLD)
+    oc = s.source == "opencode"
+    name = clip(s.name, w - (33 if oc else 22))
+    sc.put(y, x + 2, f" {name} ", curses.A_BOLD)
+    if oc:
+        sc.put(y, x + 4 + len(name), "OpenCode ", curses.color_pair(C_SUB) | curses.A_BOLD)
 
-    badge = {"busy": f" {SPIN[f % len(SPIN)]} WORKING ", "idle": " ○ IDLE ",
+    badge = {"busy": f" {SPIN[f % len(SPIN)]} WORKING ", "idle": att[0] if att else " ○ IDLE ",
              "wait": " ▲ NEEDS YOU " if (f // 6) % 2 else " △ NEEDS YOU "}.get(st, f" ! {s.status.upper()} ")
-    sc.put(y, x + w - len(badge) - 2, badge, col | curses.A_BOLD | (curses.A_REVERSE if st != "idle" else 0))
+    sc.put(y, x + w - len(badge) - 2, badge, col | curses.A_BOLD | (curses.A_REVERSE if st != "idle" or att else 0))
 
     # robot
     rows = sprite(st, f)
@@ -791,12 +1404,12 @@ def draw_card(sc, s, y, x, w, h, f):
 
     act = s.activity
     if st == "wait":
-        w = s.wait
-        label = {"permission": "approve", "question": "answer", "input": "input"}.get(w.get("reason"), "respond")
-        tool = f" ⚒ {w['tool']}" if w.get("tool") else ""
+        wt = s.wait  # not `w`: that's the card's width, still needed for the sub-agent lines
+        label = {"permission": "approve", "question": "answer", "input": "input"}.get(wt.get("reason"), "respond")
+        tool = f" ⚒ {wt['tool']}" if wt.get("tool") else ""
         sc.put(line, ix, clip(f"{label}{tool}", iw), col | curses.A_BOLD)
-        if w.get("detail"):
-            sc.put(line + 1, ix + 5, clip(w["detail"], iw - 5), 0)
+        if wt.get("detail"):
+            sc.put(line + 1, ix + 5, clip(wt["detail"], iw - 5), 0)
     elif act:
         kind, label, detail = act
         prefix = "now " if st == "busy" else "last"
@@ -814,7 +1427,7 @@ def draw_card(sc, s, y, x, w, h, f):
     if st == "wait":
         meta = f"waiting {fmt_dur(time.time() - (s.wait.get('since') or time.time()))}"
     else:
-        verb = "working" if st == "busy" else "idle" if st == "idle" else s.status
+        verb = "working" if st == "busy" else (att[2] if att else "idle") if st == "idle" else s.status
         meta = f"{verb} {fmt_dur(s.state_secs())}"
     meta += f" · up {fmt_dur(s.uptime_secs())}"
     if s.model:
@@ -844,6 +1457,11 @@ def draw_card(sc, s, y, x, w, h, f):
         if cost.get("total_lines_added") is not None:
             extra += f" · +{cost['total_lines_added']}/-{cost.get('total_lines_removed', 0)}"
         sc.put(line, ix + 14, clip(extra, iw - 14), dim)
+    elif oc:  # a model OpenCode's catalog doesn't size, e.g. a local one
+        extra = "ctx  ?" + (f" · ${cost['total_cost_usd']:.2f}" if cost.get("total_cost_usd") is not None else "")
+        if cost.get("total_lines_added") is not None:
+            extra += f" · +{cost['total_lines_added']}/-{cost.get('total_lines_removed') or 0}"
+        sc.put(line, ix, clip(extra, iw), dim)
     else:
         sc.put(line, ix, "ctx  (waiting for status line)", dim)
 
@@ -855,7 +1473,7 @@ def draw_card(sc, s, y, x, w, h, f):
         sc.put(r, x + 7, clip(f"{sa.desc}", w - 10), curses.color_pair(C_SUB))
 
 
-def draw_header(sc, sessions, f, show_idle, compact=False):
+def draw_header(sc, sessions, f, show_idle, compact=False, opencode=None):
     title = " CLAUDE COMMAND CENTER "
     busy = sum(s.busy and not s.waiting for s in sessions)
     subs = sum(len(s.active_subs()) for s in sessions)
@@ -878,6 +1496,8 @@ def draw_header(sc, sessions, f, show_idle, compact=False):
     clock = time.strftime("%H:%M:%S")
     sc.put(0, sc.w - len(clock) - 2, clock, curses.color_pair(C_DIM))
     hint = f"q quit · i {'hide' if show_idle else 'show'} idle · u {'expand' if compact else 'compact'} usage"
+    if opencode is not None:  # only offered when OpenCode is installed
+        hint += f" · o {'hide' if opencode else 'show'} OpenCode"
     sc.put(sc.h - 1, 1, hint, curses.color_pair(C_DIM) | curses.A_DIM)
 
 
@@ -1038,7 +1658,32 @@ def usage_rows(store, f, width, compact):
     if not compact:
         cost.append([("api-equivalent; subscriptions aren't billed per token", dim)])
     rows.append(("cost", cost))
+    if store.oc:
+        rows.append(("opencode", opencode_groups(store, compact)))
     return rows
+
+
+def opencode_groups(store, compact):
+    """The usage panel's OpenCode row: today's tokens, cost, replies and models."""
+    dim = curses.color_pair(C_DIM) | curses.A_DIM
+    if store.oc.error:
+        return [[(clip(store.oc.error, 70), curses.color_pair(C_WARN))]]
+    t = store.oc.totals()
+    if not t["messages"]:
+        return [[("no OpenCode activity yet today", dim)]]
+    groups = [[(fmt_tokens(t["output"]), curses.color_pair(C_SUB) | curses.A_BOLD), (" out", dim)],
+              [("≈$", dim), (f"{t['cost']:.2f}", curses.A_BOLD), (" today", dim)]]
+    if not compact:
+        groups.insert(1, [(fmt_tokens(t["input"] + t["cache_write"] + t["output"]), curses.A_BOLD), (" processed", dim)])
+        groups.append([(str(t["messages"]), curses.A_BOLD), (" replies", dim)])
+        total = sum(t["models"].values()) or 1
+        for m, v in sorted(t["models"].items(), key=lambda kv: -kv[1])[:2]:
+            groups.append([(pretty_model(m) + " ", curses.A_BOLD), (f"{v / total:.0%}", dim)])
+    return groups
+
+
+def label_width(store):
+    return 10 if store.oc else 8  # room for "opencode"
 
 
 def layout_rows(rows, width, label_w):
@@ -1212,14 +1857,14 @@ def draw_panels(sc, store, f, y, width, compact=False):
     """
     if compact or width < 60:
         rows = usage_rows(store, f, width - 2, compact) + [projects_row(store, f)]
-        lines = layout_rows(rows, width - 2, 8)
+        lines = layout_rows(rows, width - 2, label_width(store))
         draw_lines(sc, y, 1, lines)
         return len(lines)
 
     pw = min(100, width - SIDE_USAGE_W - 1)
     if pw >= 64:  # side by side, both boxes as tall as the taller one
         uw = width - pw - 1
-        ulines = layout_rows(usage_rows(store, f, uw - 4, False), uw - 4, 8)
+        ulines = layout_rows(usage_rows(store, f, uw - 4, False), uw - 4, label_width(store))
         plines, right, foot = project_panel(store, f, pw - 4, max(len(ulines), 5))
         h = max(len(ulines), len(plines)) + 2
         draw_box(sc, y, 0, uw, h, "USAGE")
@@ -1228,7 +1873,7 @@ def draw_panels(sc, store, f, y, width, compact=False):
         draw_lines(sc, y + 1, uw + 3, plines)
         return h
 
-    ulines = layout_rows(usage_rows(store, f, width - 4, False), width - 4, 8)
+    ulines = layout_rows(usage_rows(store, f, width - 4, False), width - 4, label_width(store))
     draw_box(sc, y, 0, width, len(ulines) + 2, "USAGE")
     draw_lines(sc, y + 1, 2, ulines)
     y2 = y + len(ulines) + 2
@@ -1238,25 +1883,25 @@ def draw_panels(sc, store, f, y, width, compact=False):
     return len(ulines) + len(plines) + 4
 
 
-def draw_empty(sc, f):
+def draw_empty(sc, f, opencode=False):
     cy, cx = sc.h // 2 - 3, sc.w // 2 - 7
     for i, row in enumerate(EMPTY_BOT):
         sc.put(cy + i, cx, row, curses.color_pair(C_IDLE) | curses.A_DIM)
-    msg = "No Claude sessions running" + "." * ((f // 6) % 4)
-    sc.put(cy + len(EMPTY_BOT) + 1, sc.w // 2 - 13, msg, curses.color_pair(C_DIM))
+    msg = ("No Claude or OpenCode sessions running" if opencode else "No Claude sessions running") + "." * ((f // 6) % 4)
+    sc.put(cy + len(EMPTY_BOT) + 1, sc.w // 2 - (19 if opencode else 13), msg, curses.color_pair(C_DIM))
 
 
 def draw(scr, store, f, show_idle, compact=False):
     sc = Screen(scr)
     sessions = store.ordered()
-    draw_header(sc, sessions, f, show_idle, compact)
-    visible = [s for s in sessions if show_idle or not s.idle]
+    draw_header(sc, sessions, f, show_idle, compact, bool(store.oc) if opencode_installed() else None)
+    visible = [s for s in sessions if show_idle or not s.idle or s.attention]
     cols = max(1, min(len(visible), sc.w // 56))
     w = min(MAX_CARD_W, (sc.w - 1) // cols)
     grid_w = cols * w - 1 if visible else min(sc.w - 1, MAX_CARD_W * 2)
     top = 2 + draw_panels(sc, store, f, 2, grid_w, compact) + 1
     if not visible:
-        draw_empty(sc, f)
+        draw_empty(sc, f, bool(store.oc))
         return
 
     y = top
@@ -1272,7 +1917,7 @@ def draw(scr, store, f, show_idle, compact=False):
         y += h
 
 
-def run(scr):
+def run(scr, opencode=False):
     curses.curs_set(0)
     scr.timeout(int(1000 / FPS))
     curses.start_color()
@@ -1292,7 +1937,7 @@ def run(scr):
     sc = Screen(scr)  # the first scan of today's transcripts can take a second or two
     sc.put(sc.h // 2, max(0, sc.w // 2 - 18), "scanning today's Claude transcripts…", curses.color_pair(C_DIM))
     scr.refresh()
-    store = Store()
+    store = Store(opencode)
     show_idle = True
     compact = False
     frame = 0
@@ -1309,14 +1954,17 @@ def run(scr):
             show_idle = not show_idle
         if ch in (ord("u"), ord("U")):
             compact = not compact
+        if ch in (ord("o"), ord("O")) and opencode_installed():
+            store.set_opencode(not store.oc)
+            last_poll = 0.0
         scr.erase()
         draw(scr, store, frame, show_idle, compact)
         scr.refresh()
         frame += 1
 
 
-def once():
-    store = Store()
+def once(opencode=False):
+    store = Store(opencode)
     store.refresh()
     time.sleep(DATA_INTERVAL)
     store.refresh()
@@ -1333,6 +1981,12 @@ def once():
     if t["models"]:
         print("models: " + ", ".join(f"{pretty_model(m)} {fmt_tokens(v)} out" for m, v in sorted(t["models"].items(), key=lambda kv: -kv[1])))
     print(f"cost: ≈${store.cost_today:.2f} today ({store.cost_sessions} sessions)")
+    if store.oc:
+        o = store.oc.totals()
+        print(f"opencode: {store.oc.error}" if store.oc.error else
+              f"opencode: {fmt_tokens(o['output'])} out, {fmt_tokens(o['input'] + o['cache_write'] + o['output'])} processed,"
+              f" ≈${o['cost']:.2f}, {o['messages']} replies"
+              + "".join(f", {pretty_model(m)} {fmt_tokens(v)} out" for m, v in sorted(o["models"].items(), key=lambda kv: -kv[1])))
     projects = store.projects_today()
     if projects:
         print(f"projects: {fmt_hm(store.ledger.active)} active today")
@@ -1341,14 +1995,16 @@ def once():
         print(f"  {p.name:<22} {fmt_hm(p.active):>6}  {len(p.sessions)} sess · {p.prompts} prompts"
               f" · {len(p.files)} files +{p.added}/-{p.removed} · {p.commits} commits"
               f" · {fmt_tokens(p.output)} out" + (f" · ${cost:.2f}" if cost else "")
-              + (f"  [{p.branch}]" if p.branch else "") + (f"  ({live})" if live else ""))
+              + (f"  [{p.branch}]" if p.branch else "") + (f"  ({live})" if live else "")
+              + ("  via OpenCode" if p.sources == {"opencode"} else "  + OpenCode" if "opencode" in p.sources else ""))
     if not sessions:
-        print("No Claude sessions running.")
+        print("No Claude or OpenCode sessions running." if store.oc else "No Claude sessions running.")
     for s in sessions:
         act = s.activity
         act_s = f"{act[1]} {act[2]}".strip() if act else "-"
-        status = "WAITING" if s.waiting else s.status
-        print(f"[{status:>7}] {s.name}  pid={s.pid}  {s.project}")
+        status = "WAITING" if s.waiting else s.attention.upper() if s.attention else s.status
+        print(f"[{status:>7}] {s.name}  " + ("OpenCode " if s.source == "opencode" else "")
+              + f"{'sid=' + s.sid if s.pid is None else f'pid={s.pid}'}  {s.project}")
         if s.waiting:
             print(f"          needs you: {s.wait.get('reason')} {s.wait.get('tool', '')} {s.wait.get('detail', '')}".rstrip())
         print(f"          {s.title or '(untitled)'}  · {pretty_model(s.model)} · up {fmt_dur(s.uptime_secs())}")
@@ -1356,7 +2012,7 @@ def once():
         if s.sl:
             ctx = (s.sl.get("context_window") or {}).get("used_percentage")
             cost = (s.sl.get("cost") or {}).get("total_cost_usd")
-            print(f"          ctx {ctx}% · ${cost or 0:.2f}")
+            print(f"          ctx {'?' if ctx is None else f'{ctx:.0f}'}% · ${cost or 0:.2f}")
         for sa in s.active_subs():
             print(f"          └ {sa.desc}")
 
@@ -1382,8 +2038,10 @@ def snapshot(store):
         cost = s.sl.get("cost") or {}
         sessions.append({
             "pid": s.pid, "sid": s.sid, "cwd": s.info.get("cwd"), "transcript": s.transcript,
+            "source": s.source, "key": f"{s.source}:{s.sid if s.pid is None else s.pid}",
             "name": s.name, "title": s.title or "", "project": s.project, "model": pretty_model(s.model),
             "state": st, "status": s.status, "doing": doing, "detail": detail or "",
+            "attention": s.attention, "outcome": s.outcome,
             "elapsed": fmt_dur(elapsed), "state_secs": round(max(0, elapsed), 1), "uptime": fmt_dur(s.uptime_secs()),
             "ctx": (s.sl.get("context_window") or {}).get("used_percentage"),
             "cost": cost.get("total_cost_usd"),
@@ -1421,21 +2079,40 @@ def snapshot(store):
     items = [{"name": p.name, "state": state, "time": fmt_hm(p.active), "active_secs": p.active,
               "hourly": p.hourly, "prompts": p.prompts, "files": len(p.files), "added": p.added,
               "removed": p.removed, "commits": p.commits, "cost": cost, "output": p.output,
-              "branch": p.branch, "sessions": len(p.sessions)} for p, state, cost in projects]
+              "branch": p.branch, "sessions": len(p.sessions), "sources": sorted(p.sources)}
+             for p, state, cost in projects]
     first = min((p.first for p, _, _ in projects), default=0)
     return {
         "time": now, "sessions": sessions, "limits": limits,
         "limits_stale": f"limits as of {fmt_dur(now - store.limits_at)} ago" if stale else None,
         "today": today,
-        "setup": setup_status(),
+        "opencode": opencode_snapshot(store),
+        "setup": dict(setup_status(), opencode=oc_plugin_installed() if store.oc else None),
         "projects": {"active": fmt_hm(store.ledger.active), "first": datetime.fromtimestamp(first).strftime("%H:%M") if first else "",
                      "items": items},
     }
 
 
-def stream(single=False):
+def opencode_snapshot(store):
+    """Whether OpenCode is installed (the widget offers its menu item only then), and
+    with --opencode, today's OpenCode usage."""
+    if not opencode_installed():
+        return None
+    out = {"installed": True, "enabled": bool(store.oc)}
+    if store.oc:
+        t = store.oc.totals()
+        total = sum(t["models"].values()) or 1
+        out.update(error=store.oc.error, today={
+            "output": t["output"], "processed": t["input"] + t["cache_write"] + t["output"],
+            "cache_read": t["cache_read"], "replies": t["messages"], "cost": t["cost"], "hourly": t["hourly"],
+            "models": [{"name": pretty_model(m), "share": v / total}
+                       for m, v in sorted(t["models"].items(), key=lambda kv: -kv[1])[:3]]})
+    return out
+
+
+def stream(single=False, opencode=False):
     """--json: one snapshot per line, every DATA_INTERVAL seconds, until the reader goes away."""
-    store = Store()
+    store = Store(opencode)
     try:
         while True:
             store.refresh()
@@ -1452,6 +2129,7 @@ def stream(single=False):
 SETTINGS = os.path.join(HOME, ".claude", "settings.json")
 HOOK_NAME = "ccwatch-hook.sh"
 MARKER = "# ccwatch:"
+MARKER_JS = "// ccwatch:"  # first line of ccwatch-opencode.js
 OWN_STATUSLINE = os.path.join(HOME, ".claude", "ccwatch-statusline.sh")
 # event -> matcher (None: every occurrence); the table under "Waiting hook" in the README
 HOOK_EVENTS = {
@@ -1628,8 +2306,10 @@ def hook_source():
 INPUT_LINE = re.compile(r"^\s*input=\$\(cat\)\s*$", re.M)
 
 
-def install(dry=False):
-    """Add the hook entries and the status line capture. Prints what it did; returns an exit code."""
+def install(dry=False, opencode=False):
+    """Add the hook entries and the status line capture, and with opencode, the OpenCode
+    plugin (an installed one is kept up to date either way). Prints what it did; returns
+    an exit code."""
     import shlex
     import shutil
     say = print
@@ -1685,6 +2365,23 @@ def install(dry=False):
         say("! the status line is an inline command; make it save its input like this (the input in $input):\n")
         say(CAPTURE_BLOCK)
 
+    # 4. the OpenCode plugin
+    plugin = None  # its new text
+    if opencode or oc_plugin_installed():
+        src_js = read_text(os.path.join(os.path.dirname(os.path.abspath(__file__)), OC_PLUGIN_NAME))
+        if src_js is None:
+            say(f"✗ {OC_PLUGIN_NAME} not found next to ccwatch.py")
+            return 1
+        if read_text(OC_PLUGIN) == src_js:
+            say(f"✓ OpenCode plugin {tilde(OC_PLUGIN)} is up to date")
+        elif os.path.exists(OC_PLUGIN) and not oc_plugin_installed():
+            say(f"! {tilde(OC_PLUGIN)} exists and isn't ccwatch's; move it aside to install the OpenCode plugin")
+        else:
+            plugin = src_js
+            changes += 1
+            say(f"+ {'update' if os.path.exists(OC_PLUGIN) else 'add'} the OpenCode plugin {tilde(OC_PLUGIN)}"
+                " (it records which sessions wait on you)")
+
     if not find_jq():
         say("! jq not found: the hook and the status line need it (brew install jq)")
     if dry or not changes:
@@ -1704,7 +2401,12 @@ def install(dry=False):
         write_text(script, statusline)
         if script == OWN_STATUSLINE:
             os.chmod(script, 0o755)
+    if plugin is not None:
+        os.makedirs(os.path.dirname(OC_PLUGIN), exist_ok=True)
+        write_text(OC_PLUGIN, plugin)
     say("done. Restart running Claude sessions if they don't pick up the hooks; status data appears after their next reply.")
+    if plugin is not None:
+        say("     OpenCode 2.x loads the plugin by itself within seconds; OpenCode 1.x needs a restart.")
     return 0
 
 
@@ -1734,6 +2436,8 @@ def uninstall(dry=False):
             if start > 0 and not lines[start - 1].strip() and statusline.count("\n\n\n"):
                 statusline = statusline.replace("\n\n\n", "\n\n", 1)
             did.append(f"- remove the capture block from {tilde(script)}")
+    if oc_plugin_installed():
+        did.append(f"- remove the OpenCode plugin {tilde(OC_PLUGIN)}")
     for line in did or ["nothing to remove"]:
         print(line)
     if dry or not did:
@@ -1748,11 +2452,13 @@ def uninstall(dry=False):
     elif statusline is not None:
         backup(script, ".bak")
         write_text(script, statusline)
+    if oc_plugin_installed():
+        os.remove(OC_PLUGIN)
     print("done. ~/.cache/ccwatch is left in place; rm -rf it to delete the saved data.")
     return 0
 
 
-def doctor_checks():
+def doctor_checks(opencode=False):
     """[(ok, label, hint)]: ok is True, False (broken) or None (a warning)."""
     import platform
     out = []
@@ -1811,11 +2517,49 @@ def doctor_checks():
              if os.path.basename(p)[:-len(".json")] not in live]
     add(True if not stale else None, f"{len(stale)} stale \"needs you\" flag{'s' * (len(stale) != 1)}",
         "left by sessions that ended abruptly; ccwatch deletes them after a day")
+    if opencode:
+        out.extend(opencode_checks())
     return out
 
 
-def doctor():
-    checks = doctor_checks()
+def opencode_checks():
+    out = []
+
+    def add(ok, label, hint=""):
+        out.append((ok, label, hint))
+
+    if not opencode_installed():
+        add(False, "OpenCode not found", "install it from opencode.ai, or turn OpenCode monitoring off")
+        return out
+    oc = OpenCode()
+    oc.refresh()
+    oc.close()
+    if oc.error:
+        add(False, oc.error, "ccwatch reads OpenCode's database read-only; a newer OpenCode may have changed it")
+    else:
+        add(True, f"OpenCode database {tilde(oc.path)} ({'2.x' if oc.v2 else '1.x'} layout, "
+                  f"{len(oc.sessions)} open session{'s' * (len(oc.sessions) != 1)})")
+        add(True if oc.catalog else None, f"OpenCode model list: {len(oc.catalog)} models",
+            "without it, OpenCode cards show no context gauge")
+    if not oc_plugin_installed():
+        add(None, "OpenCode plugin not installed: OpenCode sessions never show \"needs you\"",
+            "run: ccwatch.py --install --opencode")
+    else:
+        recs = glob.glob(os.path.join(OC_STATE_DIR, "*.json"))
+        live = oc.states()
+        if live:
+            add(True, f"OpenCode plugin {tilde(OC_PLUGIN)} is reporting ({len(live)} session{'s' * (len(live) != 1)})")
+        elif recs:
+            add(None, f"OpenCode plugin {tilde(OC_PLUGIN)}: no report from a running OpenCode",
+                "OpenCode 2.x reloads plugins by itself; on 1.x, restart OpenCode")
+        else:
+            add(None, f"OpenCode plugin {tilde(OC_PLUGIN)}: nothing reported yet",
+                "it reports once a session starts working (on OpenCode 1.x, restart it first)")
+    return out
+
+
+def doctor(opencode=False):
+    checks = doctor_checks(opencode)
     for ok, label, hint in checks:
         mark = {True: "✓", False: "✗", None: "!"}[ok]
         print(f"{mark} {label}" + (f"\n    {hint}" if hint and ok is not True else ""))
@@ -1905,6 +2649,11 @@ RAISE_WINDOW = """on run argv
 end run"""
 
 
+# iTerm2 3.5+ runs shells under iTermServer, a child of launchd rather than of iTerm2:
+# helper in an ancestor's path -> the running app's executable
+HOST_HELPERS = {"/iTerm2/iTermServer": ".app/Contents/MacOS/iTerm2"}
+
+
 def host_of(pid):
     """(bundle path, bundle id, app pid, tty) of the app a claude process runs inside, or None."""
     import plistlib
@@ -1923,6 +2672,13 @@ def host_of(pid):
         comm = procs[p][2]
         if ".app/" in comm:
             bundle, app = comm[:comm.index(".app/") + 4], p
+        elif not bundle:
+            for helper, exe in HOST_HELPERS.items():  # a daemon outside the app that the app owns
+                if helper in comm:
+                    app = next((q for q, (_, _, c) in procs.items() if c.endswith(exe)), None)
+                    if app:
+                        c = procs[app][2]
+                        bundle = c[:c.index(".app/") + 4]
         p = procs[p][0]
     if not bundle:
         return None
@@ -1940,7 +2696,9 @@ def vscode_folder(support, cwd):
     state = load_json(os.path.join(HOME, "Library", "Application Support", support,
                                    "User", "globalStorage", "storage.json")) or {}
     best = ""
-    for w in (state.get("windowsState") or {}).get("openedWindows") or []:
+    ws = state.get("windowsState") or {}
+    # openedWindows is only written when the app quits; while it runs, lastActiveWindow is current
+    for w in (ws.get("openedWindows") or []) + [ws.get("lastActiveWindow") or {}]:
         uri = w.get("folder") or ""
         if not uri.startswith("file://"):
             continue
@@ -1973,6 +2731,8 @@ def focus(pid):
         return "no host app found"
     bundle, bid, app, tty = host
     cwd = ((load_json(os.path.join(SESS_DIR, f"{pid}.json")) or {}).get("cwd") or "").rstrip("/")
+    if not cwd:  # not a claude process: an OpenCode terminal's directory
+        cwd = next((d for d, p in opencode_clients({}).items() if p == pid), "")
     name = os.path.basename(bundle)[:-4]
     script = {"com.googlecode.iterm2": ITERM_FOCUS, "com.apple.Terminal": TERMINAL_FOCUS}.get(bid)
     if script and tty:
@@ -1993,22 +2753,22 @@ def focus(pid):
 
 if __name__ == "__main__":
     if "--install" in sys.argv:
-        sys.exit(install(dry="--dry-run" in sys.argv))
+        sys.exit(install(dry="--dry-run" in sys.argv, opencode="--opencode" in sys.argv))
     elif "--uninstall" in sys.argv:
         sys.exit(uninstall(dry="--dry-run" in sys.argv))
     elif "--doctor" in sys.argv:
-        sys.exit(doctor())
+        sys.exit(doctor(opencode="--opencode" in sys.argv))
     elif "--focus" in sys.argv:
         i = sys.argv.index("--focus")
         print(focus(int(sys.argv[i + 1])) if i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit()
               else "usage: ccwatch.py --focus <pid>")
     elif "--json" in sys.argv:
-        stream(single="--once" in sys.argv)
+        stream(single="--once" in sys.argv, opencode="--opencode" in sys.argv)
     elif "--once" in sys.argv:
-        once()
+        once(opencode="--opencode" in sys.argv)
     else:
         os.environ.setdefault("ESCDELAY", "25")
         try:
-            curses.wrapper(run)
+            curses.wrapper(run, "--opencode" in sys.argv)
         except KeyboardInterrupt:
             pass
