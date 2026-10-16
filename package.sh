@@ -29,7 +29,7 @@ APP="$app" VERSION="$version" ARCHS="arm64 x86_64" ./build-widget.sh
 
 # The app runs the bundled copy (see Feed.locateScript in ccwidget.swift).
 mkdir -p "$res"
-cp ccwatch.py ccwatch-hook.sh README.md "$res/"
+cp ccwatch.py ccwatch-hook.sh ccwatch-opencode.js README.md "$res/"
 chmod +x "$res/ccwatch.py" "$res/ccwatch-hook.sh"
 
 "$app/Contents/MacOS/ccwidget" --iconset "$tmp/AppIcon.iconset"

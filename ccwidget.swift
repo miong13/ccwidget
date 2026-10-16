@@ -27,17 +27,41 @@ struct Snapshot: Decodable {
     var today: Today?
     var projects: Projects?
     var setup: Setup?
+    var opencode: OpenCodeInfo?   // nil when OpenCode isn't installed
+}
+
+/// OpenCode: installed (so the menu offers it), monitored (the "Monitor OpenCode" item), today's usage.
+struct OpenCodeInfo: Decodable {
+    var installed: Bool
+    var enabled: Bool
+    var error: String?
+    var today: OpenCodeToday?
+}
+
+struct OpenCodeToday: Decodable {
+    var output: Int
+    var processed: Int
+    var cacheRead: Int
+    var replies: Int
+    var cost: Double
+    var hourly: [Int]
+    var models: [ModelShare]?
 }
 
 /// Whether the hook ("needs you") and the status line capture (limits, ctx, cost) are set up.
 struct Setup: Decodable {
     var hooks: Bool
     var statusline: Bool
+    var opencode: Bool?   // the OpenCode plugin; nil unless OpenCode is monitored
+
+    var complete: Bool { hooks && statusline && opencode != false }
 }
 
 struct Sess: Decodable {
-    var pid: Int?
+    var pid: Int?         // OpenCode sessions have one only while a terminal is open on them
     var sid: String?
+    var source: String?   // "claude" or "opencode"
+    var key: String?      // stable across snapshots, for both kinds
     var cwd: String?
     var transcript: String?
     var name: String
@@ -46,6 +70,8 @@ struct Sess: Decodable {
     var model: String?
     var state: String
     var status: String?
+    var attention: String?   // OpenCode: "unseen", "failed" or "interrupted", a finished turn nobody has looked at
+    var outcome: String?     // OpenCode: how its last turn ended
     var doing: String?
     var detail: String?
     var elapsed: String?
@@ -56,6 +82,9 @@ struct Sess: Decodable {
     var subs: [String]?
     var subsTotal: Int?
     var spark: [Int]?
+
+    var ident: String { key ?? pid.map { "claude:\($0)" } ?? sid ?? name }
+    var isOpenCode: Bool { source == "opencode" }
 }
 
 struct Limit: Decodable {
@@ -104,6 +133,7 @@ struct Proj: Decodable {
     var output: Int
     var branch: String?
     var sessions: Int
+    var sources: [String]?
 }
 
 struct Projects: Decodable {
@@ -122,6 +152,7 @@ final class Feed: ObservableObject {
     private var proc: Process?
     private var buffer = Data()
     private var stopping = false
+    private var restarting = false
     private var failures = 0     // restarts in a row without a good snapshot, for the backoff
     private var lastError = ""   // last stderr line; shown only if the feed dies
     private let decoder: JSONDecoder = {
@@ -162,7 +193,7 @@ final class Feed: ObservableObject {
         lastError = ""
         let p = Process()
         p.executableURL = URL(fileURLWithPath: Feed.locatePython())
-        p.arguments = ["-B", script, "--json"]
+        p.arguments = ["-B", script, "--json"] + Feed.opencodeArgs
         let out = Pipe(), err = Pipe()
         p.standardOutput = out
         p.standardError = err
@@ -181,6 +212,10 @@ final class Feed: ObservableObject {
         p.terminationHandler = { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self = self, !self.stopping else { return }
+                if self.restarting {  // asked for: start again straight away
+                    self.restarting = false
+                    return self.start()
+                }
                 // 3 s, 6 s, 12 s … up to a minute while it keeps failing
                 let delay = min(60, 3 * pow(2, Double(self.failures)))
                 self.failures += 1
@@ -195,6 +230,20 @@ final class Feed: ObservableObject {
         } catch {
             problem = "couldn't start python3: \(error.localizedDescription)"
         }
+    }
+
+    /// Whether OpenCode sessions are monitored too (right-click menu → Monitor OpenCode).
+    static var opencodeOn: Bool { UserDefaults.standard.bool(forKey: "opencode") }
+    static var opencodeArgs: [String] { opencodeOn ? ["--opencode"] : [] }
+
+    /// Start the feed again, e.g. with OpenCode switched on or off; the last snapshot stays up meanwhile.
+    func restart() {
+        guard let p = proc, p.isRunning else { return start() }
+        restarting = true
+        for pipe in [p.standardOutput, p.standardError] {  // nothing more from the old one
+            (pipe as? Pipe)?.fileHandleForReading.readabilityHandler = nil
+        }
+        p.terminate()
     }
 
     /// Bring the terminal/editor window running a session to the front (ccwatch.py --focus).
@@ -540,7 +589,7 @@ struct SessionRow: View {
         switch s.state {
         case "busy": return Palette.busy
         case "wait": return Palette.warn
-        case "idle": return Palette.dim
+        case "idle": return s.attention.map(AttentionBadge.color) ?? Palette.dim
         default: return Palette.warn
         }
     }
@@ -551,10 +600,12 @@ struct SessionRow: View {
                 StateGlyph(state: s.state, frame: frame)
                 Text(s.title?.isEmpty == false ? s.title! : s.name)
                     .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundColor(s.state == "idle" ? .primary.opacity(0.7) : .primary)
+                    .foregroundColor(s.state == "idle" && s.attention == nil ? .primary.opacity(0.7) : .primary)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                if s.isOpenCode { OpenCodeBadge() }
                 Spacer(minLength: 4)
+                if s.state == "idle", let att = s.attention { AttentionBadge(attention: att) }
                 if let ctx = s.ctx, !compact || ctx >= 80 {  // compact: only as a warning
                     CtxGauge(pct: ctx)
                 }
@@ -610,7 +661,7 @@ struct SessionRow: View {
         .onHover { inside in  // click jumps to the session's window
             if inside {
                 HoverTarget.session = s
-            } else if HoverTarget.session?.pid == s.pid {
+            } else if HoverTarget.session?.ident == s.ident {
                 HoverTarget.session = nil
             }
             guard s.pid != nil, inside != hovering else { return }
@@ -619,7 +670,7 @@ struct SessionRow: View {
         }
         .onDisappear {
             if hovering { NSCursor.pop() }
-            if HoverTarget.session?.pid == s.pid { HoverTarget.session = nil }
+            if HoverTarget.session?.ident == s.ident { HoverTarget.session = nil }
         }
         .onTapGesture {
             if let pid = s.pid { Feed.focus(pid: pid) }
@@ -631,9 +682,48 @@ struct SessionRow: View {
         var facts = [s.model, s.uptime.map { "up \($0)" }].compactMap { $0?.isEmpty == false ? $0 : nil }
         if let ctx = s.ctx { facts.append("ctx \(Int(ctx.rounded()))%") }
         if let cost = s.cost { facts.append(String(format: "≈$%.2f", cost)) }
-        var lines = [facts.joined(separator: " · ")].filter { !$0.isEmpty }
-        if s.pid != nil { lines.append("Click to show this session's window · right-click for more") }
+        var lines = [(s.isOpenCode ? "OpenCode session" : ""), facts.joined(separator: " · ")].filter { !$0.isEmpty }
+        if s.pid != nil {
+            lines.append("Click to show this session's window · right-click for more")
+        } else if s.isOpenCode {
+            lines.append("Not open in a terminal · right-click for more")
+        }
         return lines.joined(separator: "\n")
+    }
+}
+
+/// An OpenCode turn that ended while no OpenCode window showed it.
+struct AttentionBadge: View {
+    let attention: String
+
+    static func color(_ attention: String) -> Color {
+        attention == "failed" ? Palette.danger : attention == "interrupted" ? Palette.warn : Palette.busy
+    }
+
+    var body: some View {
+        let label = attention == "failed" ? "✗ failed" : attention == "interrupted" ? "■ interrupted" : "✓ done · unseen"
+        Text(label)
+            .font(.system(size: 8.5, weight: .bold))
+            .foregroundColor(Self.color(attention))
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(Self.color(attention).opacity(0.15)))
+            .fixedSize()
+            .help(attention == "unseen" ? "Finished while no OpenCode window showed it"
+                  : "Its last turn \(attention == "failed" ? "failed" : "was interrupted"), and no OpenCode window has shown it since")
+    }
+}
+
+/// Marks an OpenCode session among the Claude ones.
+struct OpenCodeBadge: View {
+    var body: some View {
+        Text("OpenCode")
+            .font(.system(size: 8.5, weight: .bold))
+            .foregroundColor(Palette.sub)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(Capsule().stroke(Palette.sub.opacity(0.6), lineWidth: 1))
+            .fixedSize()
     }
 }
 
@@ -701,7 +791,47 @@ struct UsageSection: View {
                 }
                 .padding(.top, 2)
             }
+            if let oc = snap.opencode, oc.enabled {
+                OpenCodeUsage(info: oc, compact: compact)
+            }
         }
+    }
+}
+
+/// Today's OpenCode usage, one line under Claude's.
+struct OpenCodeUsage: View {
+    let info: OpenCodeInfo
+    let compact: Bool
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Text("OpenCode").fontWeight(.semibold).foregroundColor(Palette.sub)
+                .frame(width: compact ? nil : 96, alignment: .leading)
+            if let error = info.error {
+                Text(error).foregroundColor(Palette.warn).truncationMode(.tail)
+            } else if let t = info.today, t.replies > 0 {
+                Text(fmtTokens(t.output)).fontWeight(.bold).foregroundColor(Palette.sub)
+                Text("out ·").foregroundColor(Palette.dim)
+                Text(String(format: "≈$%.2f", t.cost)).fontWeight(.semibold)
+                if !compact {
+                    Text("· \(t.replies) replies").foregroundColor(Palette.dim)
+                    if let m = t.models?.first {
+                        Text("· \(m.name)").foregroundColor(Palette.dim).truncationMode(.tail)
+                    }
+                }
+            } else {
+                Text("no activity yet today").foregroundColor(Palette.dim)
+            }
+        }
+        .font(.system(size: 10))
+        .monospacedDigit()
+        .lineLimit(1)
+        .help(info.today.map { t in
+            "OpenCode today: \(fmtTokens(t.output)) out · \(fmtTokens(t.processed)) processed · "
+                + "+\(fmtTokens(t.cacheRead)) cache reads · \(t.replies) replies"
+                + String(format: " · ≈$%.2f", t.cost)
+                + (t.models ?? []).map { " · \($0.name) \(Int(($0.share * 100).rounded()))%" }.joined()
+        } ?? "")
     }
 }
 
@@ -754,7 +884,8 @@ struct ProjectsSection: View {
                 .help("\(p.name)\(p.branch.map { $0.isEmpty ? "" : " [\($0)]" } ?? "")\n"
                       + "\(p.time) spent · \(p.sessions) session\(p.sessions == 1 ? "" : "s") · \(p.prompts) prompts\n"
                       + "\(p.files) files · +\(p.added) −\(p.removed) lines · \(p.commits) commits"
-                      + (p.cost.map { String(format: " · ≈$%.2f", $0) } ?? ""))
+                      + (p.cost.map { String(format: " · ≈$%.2f", $0) } ?? "")
+                      + (p.sources == ["opencode"] ? "\nvia OpenCode" : p.sources?.contains("opencode") == true ? "\nClaude + OpenCode" : ""))
             }
             if projects.items.count > shown.count {
                 Text("+\(projects.items.count - shown.count) more")
@@ -772,9 +903,10 @@ struct SetupPrompt: View {
     let setup: Setup
 
     var body: some View {
-        let what = setup.hooks ? "Plan limits aren't set up"
-            : setup.statusline ? "“Needs you” alerts aren't set up"
-            : "“Needs you” alerts and limits aren't set up"
+        let what = !setup.hooks && !setup.statusline ? "“Needs you” alerts and limits aren't set up"
+            : !setup.hooks ? "“Needs you” alerts aren't set up"
+            : !setup.statusline ? "Plan limits aren't set up"
+            : "OpenCode “needs you” alerts aren't set up"
         HStack(spacing: 6) {
             Image(systemName: "wrench.and.screwdriver").foregroundColor(Palette.warn)
             Text(what).foregroundColor(.primary.opacity(0.8)).lineLimit(1)
@@ -785,7 +917,9 @@ struct SetupPrompt: View {
                 Text("Set up…").font(.system(size: 10, weight: .semibold)).foregroundColor(Palette.accent)
             }
             .buttonStyle(.plain)
-            .help("Add the ccwatch hook and status line capture to ~/.claude (shows the changes first)")
+            .help(setup.opencode == false && setup.hooks && setup.statusline
+                  ? "Add the ccwatch plugin to OpenCode (shows the changes first)"
+                  : "Add the ccwatch hook and status line capture to ~/.claude (shows the changes first)")
         }
         .font(.system(size: 10))
         .padding(.horizontal, 8)
@@ -827,15 +961,16 @@ struct WidgetView: View {
         let snap = feed.snap
         VStack(alignment: .leading, spacing: 7) {
             Header(snap: snap, frame: frame, compact: $compact)
-            if let setup = snap?.setup, !(setup.hooks && setup.statusline) {
+            if let setup = snap?.setup, !setup.complete {
                 SetupPrompt(setup: setup)
             }
             if let snap = snap {
                 let sessions = compact
-                    ? Array(snap.sessions.filter { $0.state != "idle" }.prefix(4))
+                    ? Array(snap.sessions.filter { $0.state != "idle" || $0.attention != nil }.prefix(4))
                     : Array(snap.sessions.prefix(6))
                 if snap.sessions.isEmpty {
-                    Text("No Claude sessions running" + String(repeating: ".", count: (frame / 6) % 4))
+                    Text((snap.opencode?.enabled == true ? "No Claude or OpenCode sessions running" : "No Claude sessions running")
+                         + String(repeating: ".", count: (frame / 6) % 4))
                         .font(.system(size: 10.5)).foregroundColor(Palette.dim)
                 }
                 ForEach(Array(sessions.enumerated()), id: \.offset) { _, s in
@@ -1191,7 +1326,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     static let thresholds = [100, 95, 80]
 
     private var watch: AnyCancellable?
-    private var last: [Int: (state: String, secs: Double)] = [:]  // by pid, from the previous snapshot
+    private var last: [String: (state: String, secs: Double)] = [:]  // by Sess.ident, from the previous snapshot
     private var primed = false  // the first snapshot only sets the baseline
 
     init(feed: Feed) {
@@ -1202,20 +1337,22 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     private func update(_ snap: Snapshot?) {
         guard let snap = snap else { return }
-        var now: [Int: (state: String, secs: Double)] = [:]
+        var now: [String: (state: String, secs: Double)] = [:]
         for s in snap.sessions {
-            guard let pid = s.pid else { continue }
-            now[pid] = (s.state, s.stateSecs ?? 0)
-            guard primed, let prev = last[pid] else { continue }
+            let id = s.ident
+            now[id] = (s.state, s.stateSecs ?? 0)
+            guard primed, let prev = last[id] else { continue }
             let title = s.title?.isEmpty == false ? s.title! : s.name
-            if prev.state == "busy", s.state == "idle", Kind.finished.enabled, prev.secs >= Self.finishedAfter {
-                post(id: "finished-\(pid)", title: "Finished: \(title)",
-                     body: "\(s.project ?? s.name) · worked \(fmtDuration(prev.secs))", pid: pid)
+            // a long turn finished, or an OpenCode turn failed however short (not one you stopped yourself)
+            let bad = s.outcome == "failed"
+            if prev.state == "busy", s.state == "idle", Kind.finished.enabled, prev.secs >= Self.finishedAfter || bad {
+                post(id: "finished-\(id)", title: "\(s.outcome == "failed" ? "Failed" : s.outcome == "interrupted" ? "Interrupted" : "Finished"): \(title)",
+                     body: "\(s.project ?? s.name) · worked \(fmtDuration(prev.secs))", pid: s.pid)
             }
             if prev.state != "wait", s.state == "wait", Kind.waiting.enabled {
-                post(id: "waiting-\(pid)", title: "Needs you: \(title)",
+                post(id: "waiting-\(id)", title: "Needs you: \(title)",
                      body: [s.doing, s.detail].compactMap { $0?.isEmpty == false ? $0 : nil }.joined(separator: " · "),
-                     pid: pid)
+                     pid: s.pid)
             }
         }
         last = now
@@ -1424,7 +1561,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let assistant = AssistantModel()
     var assistantPanel: WidgetPanel!
     private var assistantVisible = false
-    private var dismissed = Set<Int>()  // pids hidden with ×, until they stop waiting
+    private var dismissed = Set<String>()  // sessions (Sess.ident) hidden with ×, until they stop waiting
     private var assistantWatch: AnyCancellable?
 
     func setUpAssistant() {
@@ -1439,7 +1576,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         p.hidesOnDeactivate = false
         let host = NSHostingView(rootView: AssistantView(model: assistant, onDismiss: { [weak self] in
             guard let self = self else { return }
-            self.dismissed = Set(self.assistant.waiting.map { $0.pid ?? 0 })
+            self.dismissed = Set(self.assistant.waiting.map { $0.ident })
             self.setAssistant(visible: false)
         }, onSize: { [weak self] in self?.fitAssistant($0) }))
         host.sizingOptions = []
@@ -1512,7 +1649,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// dismissed with × (it comes back when a different session starts waiting).
     func updateAssistant(_ snap: Snapshot?) {
         let waiting = (snap?.sessions ?? []).filter { $0.state == "wait" }
-        let pids = Set(waiting.map { $0.pid ?? 0 })
+        let pids = Set(waiting.map { $0.ident })
         dismissed.formIntersection(pids)
         assistant.waiting = waiting
         let enabled = UserDefaults.standard.object(forKey: "assistant") as? Bool ?? true
@@ -1845,12 +1982,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// Right-clicking a session row puts that session's actions at the top.
     func buildMenu(session: Sess? = nil) -> NSMenu {
         let menu = NSMenu()
-        if let s = session, s.pid != nil {
-            let header = NSMenuItem(title: s.title?.isEmpty == false ? s.title! : s.name, action: nil, keyEquivalent: "")
+        if let s = session, s.pid != nil || s.isOpenCode {
+            let header = NSMenuItem(title: (s.title?.isEmpty == false ? s.title! : s.name) + (s.isOpenCode ? " (OpenCode)" : ""),
+                                    action: nil, keyEquivalent: "")
             header.isEnabled = false
             menu.addItem(header)
             let actions: [(String, Selector, Bool)] = [
-                ("Jump to Window", #selector(jumpToSession(_:)), true),
+                ("Jump to Window", #selector(jumpToSession(_:)), s.pid != nil),
                 ("Copy Resume Command", #selector(copyResumeCommand(_:)), s.sid != nil && s.cwd != nil),
                 ("Reveal Project in Finder", #selector(revealProject(_:)), s.cwd != nil),
                 ("Reveal Transcript in Finder", #selector(revealTranscript(_:)), s.transcript != nil),
@@ -1883,6 +2021,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let helper = item("Show hovering assistant", #selector(toggleAssistant))
         helper.state = UserDefaults.standard.object(forKey: "assistant") as? Bool ?? true ? .on : .off
         menu.addItem(helper)
+        if feed.snap?.opencode?.installed == true {  // offered only when OpenCode is on this Mac
+            let oc = item("Monitor OpenCode", #selector(toggleOpenCode))
+            oc.state = Feed.opencodeOn ? .on : .off
+            oc.toolTip = "Show OpenCode sessions and usage alongside Claude's"
+            menu.addItem(oc)
+        }
         let notifications = NSMenuItem(title: "Notifications", action: nil, keyEquivalent: "")
         let nsub = NSMenu()
         for kind in Notifier.Kind.allCases {
@@ -1898,7 +2042,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         keys.state = hotKeysOn ? .on : .off
         menu.addItem(keys)
         menu.addItem(item("Open full dashboard", #selector(openDashboard)))
-        menu.addItem(item("Set Up Hooks & Status Line…", #selector(runSetup)))
+        menu.addItem(item(Feed.opencodeOn ? "Set Up Hooks, Status Line & OpenCode Plugin…" : "Set Up Hooks & Status Line…",
+                          #selector(runSetup)))
         menu.addItem(item("Run Diagnostics…", #selector(runDoctor)))
         menu.addItem(.separator())
         menu.addItem(item("Quit ccwidget", #selector(quit)))
@@ -1915,12 +2060,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if let pid = (sender.representedObject as? Sess)?.pid { Feed.focus(pid: pid) }
     }
 
-    /// `cd '<project>' && claude --resume <session id>`, ready to paste into a terminal.
+    /// `cd '<project>' && claude --resume <session id>` (or `opencode --session <id>`), ready to paste into a terminal.
     @objc func copyResumeCommand(_ sender: NSMenuItem) {
         guard let s = sender.representedObject as? Sess, let sid = s.sid, let cwd = s.cwd else { return }
         let quoted = "'" + cwd.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let resume = s.isOpenCode ? "opencode --session \(sid)" : "claude --resume \(sid)"
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString("cd \(quoted) && claude --resume \(sid)", forType: .string)
+        NSPasteboard.general.setString("cd \(quoted) && \(resume)", forType: .string)
+    }
+
+    /// Monitor OpenCode on or off: the feed restarts with or without --opencode.
+    /// Switching it on offers the plugin that shows when an OpenCode session needs you.
+    @objc func toggleOpenCode() {
+        let on = !Feed.opencodeOn
+        UserDefaults.standard.set(on, forKey: "opencode")
+        feed.restart()
+        let config = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"] ?? NSHomeDirectory() + "/.config"
+        if on, !FileManager.default.fileExists(atPath: config + "/opencode/plugins/ccwatch.js") {
+            DispatchQueue.main.async { self.runSetup() }  // shows what it would add and asks first
+        }
     }
 
     @objc func revealProject(_ sender: NSMenuItem) {
@@ -1937,25 +2095,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc func runSetup() {
         popover.performClose(nil)
         NSApp.activate(ignoringOtherApps: true)
-        let preview = Feed.run(["--install", "--dry-run"])
+        let preview = Feed.run(["--install", "--dry-run"] + Feed.opencodeArgs)
         guard preview.split(separator: "\n").contains(where: { $0.hasPrefix("+ ") }) else {
             showText("Already set up", preview)
             return
         }
         let alert = NSAlert()
-        alert.messageText = "Set up the hook and status line?"
-        alert.informativeText = "These changes are made in ~/.claude, keeping a backup of each file edited:"
+        alert.messageText = Feed.opencodeOn ? "Set up ccwatch for Claude Code and OpenCode?" : "Set up the hook and status line?"
+        alert.informativeText = Feed.opencodeOn
+            ? "These changes are made in ~/.claude and ~/.config/opencode, keeping a backup of each file edited:"
+            : "These changes are made in ~/.claude, keeping a backup of each file edited:"
         alert.accessoryView = Self.monospaced(preview.replacingOccurrences(of: "\n(dry run: nothing written)", with: ""))
         alert.addButton(withTitle: "Set Up")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        showText("Setup", Feed.run(["--install"]))
+        showText("Setup", Feed.run(["--install"] + Feed.opencodeArgs))
     }
 
     @objc func runDoctor() {
         popover.performClose(nil)
         NSApp.activate(ignoringOtherApps: true)
-        showText("ccwatch diagnostics", Feed.run(["--doctor"]))
+        showText("ccwatch diagnostics", Feed.run(["--doctor"] + Feed.opencodeArgs))
     }
 
     private func showText(_ title: String, _ text: String) {
@@ -2028,7 +2188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     @objc func openDashboard() {
         guard let script = Feed.locateScript() else { return }
-        let cmd = "\(Feed.locatePython()) '\(script.replacingOccurrences(of: "'", with: "'\\''"))'"
+        let cmd = "\(Feed.locatePython()) '\(script.replacingOccurrences(of: "'", with: "'\\''"))'" + (Feed.opencodeOn ? " --opencode" : "")
         let quoted = cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let iterm = FileManager.default.fileExists(atPath: "/Applications/iTerm.app")
         let source = iterm
