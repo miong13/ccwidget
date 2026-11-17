@@ -1468,7 +1468,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusKey = ""
     private var popoverClosed = Date.distantPast
     private var watch: AnyCancellable?
-    private var appearanceWatch: NSKeyValueObservation?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         panel = WidgetPanel(contentRect: NSRect(x: 0, y: 0, width: 370, height: 300),
@@ -1752,11 +1751,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.action = #selector(statusClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.imagePosition = .imageLeading
-            // The dotted icon is drawn in the label color, so redraw it when the
-            // menu bar flips between light and dark (wallpaper or system appearance).
-            appearanceWatch = button.observe(\.effectiveAppearance) { [weak self] _, _ in
-                DispatchQueue.main.async { self?.drawStatusIcon() }
-            }
+            // No need to watch for the menu bar flipping light/dark: robotIcon draws
+            // on demand under each menu bar's appearance. Observing effectiveAppearance
+            // looped, as macOS sets it on the button while snapshotting the icon for
+            // each display's menu bar, and every redraw starts another snapshot.
         }
         updateStatus(nil)
         watch = feed.$snap.receive(on: RunLoop.main).sink { [weak self] in self?.updateStatus($0) }
